@@ -1,0 +1,71 @@
+{
+  "id": "import-static-ipv4",
+  "revision": "1",
+  "link_delay_ns": "100",
+  "models": {
+    "pc-a": {
+      "kind": "host",
+      "interface": "eth1",
+      "ipv4": "192.0.2.10",
+      "prefix_length": 24,
+      "gateway": "192.0.2.1",
+      "mac": "02:00:00:00:00:0a"
+    },
+    "r1": {
+      "kind": "router",
+      "ports": {
+        "eth1": {
+          "ipv4": "192.0.2.1",
+          "prefix_length": 24,
+          "mac": "02:00:00:00:01:01"
+        },
+        "eth2": {
+          "ipv4": "198.51.100.1",
+          "prefix_length": 30,
+          "mac": "02:00:00:00:01:02"
+        }
+      },
+      "routes": [
+        { "network": "203.0.113.0", "prefix_length": 24, "egress": "eth2", "next_hop": "198.51.100.2" }
+      ]
+    },
+    "r2": {
+      "kind": "router",
+      "ports": {
+        "eth1": {
+          "ipv4": "198.51.100.2",
+          "prefix_length": 30,
+          "mac": "02:00:00:00:02:01"
+        },
+        "eth2": {
+          "ipv4": "203.0.113.1",
+          "prefix_length": 24,
+          "mac": "02:00:00:00:02:02"
+        }
+      },
+      "routes": [
+        { "network": "192.0.2.0", "prefix_length": 24, "egress": "eth1", "next_hop": "198.51.100.1" }
+      ]
+    },
+    "pc-b": {
+      "kind": "host",
+      "interface": "eth1",
+      "ipv4": "203.0.113.20",
+      "prefix_length": 24,
+      "gateway": "203.0.113.1",
+      "mac": "02:00:00:00:00:0b"
+    }
+  },
+  "scenario": {
+    "end_ns": "6000",
+    "arp_lifetime_ns": "1000000000",
+    "mac_lifetime_ns": "1000000000",
+    "trace_limit": 0,
+    "warmup": [],
+    "link_actions": [],
+    "probes": [
+      { "id": "forward", "source": "pc-a", "destination": "pc-b", "at_ns": "1000", "deadline_ns": "2600" },
+      { "id": "reverse", "source": "pc-b", "destination": "pc-a", "at_ns": "4000", "deadline_ns": "5600" }
+    ]
+  }
+}

@@ -1,0 +1,38 @@
+{
+  "format_version": 2,
+  "id": "stack-static-lab",
+  "revision": "1",
+  "devices": [
+    { "kind": "host", "id": "pc-a", "name": "PC-A", "ipv4": "192.0.2.10", "prefix_length": 24,
+      "gateway": "192.0.2.1", "mac": "02:00:00:00:00:0a", "port": { "id": "a-eth0", "name": "eth0" } },
+    { "kind": "router", "id": "r1", "name": "R1", "ports": [
+      { "id": "r1-lan", "name": "LAN", "ipv4": "192.0.2.1", "prefix_length": 24, "mac": "02:00:00:00:01:01" },
+      { "id": "r1-transit", "name": "Transit", "ipv4": "198.51.100.1", "prefix_length": 30, "mac": "02:00:00:00:01:02" }
+    ], "routes": [
+      { "network": "203.0.113.0", "prefix_length": 24, "egress": "r1-transit", "next_hop": "198.51.100.2" }
+    ] },
+    { "kind": "router", "id": "r2", "name": "R2", "ports": [
+      { "id": "r2-transit", "name": "Transit", "ipv4": "198.51.100.2", "prefix_length": 30, "mac": "02:00:00:00:02:01" },
+      { "id": "r2-lan", "name": "LAN", "ipv4": "203.0.113.1", "prefix_length": 24, "mac": "02:00:00:00:02:02" }
+    ], "routes": [
+      { "network": "192.0.2.0", "prefix_length": 24, "egress": "r2-transit", "next_hop": "198.51.100.1" }
+    ] },
+    { "kind": "host", "id": "pc-b", "name": "PC-B", "ipv4": "203.0.113.20", "prefix_length": 24,
+      "gateway": "203.0.113.1", "mac": "02:00:00:00:00:0b", "port": { "id": "b-eth0", "name": "eth0" } }
+  ],
+  "links": [
+    { "id": "a-r1", "ports": ["a-eth0", "r1-lan"], "delay_ns": "100" },
+    { "id": "r1-r2", "ports": ["r1-transit", "r2-transit"], "delay_ns": "100" },
+    { "id": "r2-b", "ports": ["r2-lan", "b-eth0"], "delay_ns": "100" }
+  ],
+  "scenario": {
+    "end_ns": "6000",
+    "arp_lifetime_ns": "1000000000",
+    "mac_lifetime_ns": "1000000000",
+    "trace_limit": 0,
+    "probes": [
+      { "id": "forward", "source": "pc-a", "destination": "pc-b", "at_ns": "1000", "deadline_ns": "2600" },
+      { "id": "reverse", "source": "pc-b", "destination": "pc-a", "at_ns": "4000", "deadline_ns": "5600" }
+    ]
+  }
+}

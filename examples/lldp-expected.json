@@ -1,0 +1,7 @@
+{
+  "local_port": "eth0",
+  "capture_scope": "single_link_receive_only",
+  "as_of": { "seconds": 1700000010, "nanoseconds": 0 },
+  "chassis": { "subtype": 4, "value_hex": "020000000001" },
+  "port": { "subtype": 5, "value_hex": "45746832" }
+}

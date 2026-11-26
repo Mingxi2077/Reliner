@@ -1,0 +1,32 @@
+{
+  "format_version": 2,
+  "id": "native-vlan-lab",
+  "revision": "1",
+  "devices": [
+    { "kind": "host", "id": "pc-a", "name": "PC-A", "ipv4": "192.0.2.10", "prefix_length": 24,
+      "mac": "02:00:00:00:00:0a", "port": { "id": "pc-a-eth0", "name": "eth0" } },
+    { "kind": "switch", "id": "sw1", "name": "SW1", "ports": [
+      { "id": "sw1-access", "name": "G0/2", "mode": { "kind": "access", "vlan": 10 } },
+      { "id": "sw1-uplink", "name": "G0/1", "mode": { "kind": "trunk", "allowed_vlans": [10, 20], "native_vlan": 10 } }
+    ] },
+    { "kind": "switch", "id": "sw2", "name": "SW2", "ports": [
+      { "id": "sw2-uplink", "name": "G0/1", "mode": { "kind": "trunk", "allowed_vlans": [10, 20], "native_vlan": 20 } },
+      { "id": "sw2-access", "name": "G0/2", "mode": { "kind": "access", "vlan": 10 } }
+    ] },
+    { "kind": "host", "id": "pc-b", "name": "PC-B", "ipv4": "192.0.2.20", "prefix_length": 24,
+      "mac": "02:00:00:00:00:0b", "port": { "id": "pc-b-eth0", "name": "eth0" } }
+  ],
+  "links": [
+    { "id": "a-sw1", "ports": ["pc-a-eth0", "sw1-access"], "delay_ns": "100" },
+    { "id": "sw1-sw2", "ports": ["sw1-uplink", "sw2-uplink"], "delay_ns": "100" },
+    { "id": "sw2-b", "ports": ["sw2-access", "pc-b-eth0"], "delay_ns": "100" }
+  ],
+  "scenario": {
+    "end_ns": "2000",
+    "arp_lifetime_ns": "10000",
+    "mac_lifetime_ns": "10000",
+    "probes": [
+      { "id": "ping", "source": "pc-a", "destination": "pc-b", "at_ns": "0", "deadline_ns": "2000" }
+    ]
+  }
+}

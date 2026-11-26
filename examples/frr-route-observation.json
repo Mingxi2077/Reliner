@@ -1,0 +1,170 @@
+{
+  "capture_version": 1,
+  "native_id": "stack-static-lab",
+  "native_revision": "1",
+  "native_format_version": 2,
+  "origin": "QEMU TCG isolated guest 6.12.115-0-virt boot 79ed3549-7282-44cc-a5b3-8394de595e33; quay.io/frrouting/frr:10.7.1",
+  "network_namespace": "net:[4026531840]",
+  "node_id": "r1",
+  "prefix": "203.0.113.0/24",
+  "ifname": "eth1",
+  "version": {
+    "argv": [
+      "vtysh",
+      "-d",
+      "zebra",
+      "-c",
+      "show version"
+    ],
+    "exit_code": 0,
+    "stdout": "FRRouting 10.7.1_git (r1) on Linux(6.12.115-0-virt).\nCopyright 1996-2005 Kunihiro Ishiguro, et al.\nconfigured with:\n    '--prefix=/usr' '--sysconfdir=/etc' '--localstatedir=/var' '--sbindir=/usr/lib/frr' '--libdir=/usr/lib' '--enable-rpki' '--enable-vtysh' '--enable-multipath=64' '--enable-vty-group=frrvty' '--enable-user=frr' '--enable-group=frr' '--enable-pcre2posix' '--enable-scripting' 'CC=cc' 'CXX=c++'\n"
+  },
+  "interface": {
+    "argv": [
+      "ip",
+      "-j",
+      "-4",
+      "addr",
+      "show",
+      "dev",
+      "eth1"
+    ],
+    "exit_code": 0,
+    "stdout": [
+      {
+        "ifindex": 3,
+        "link": "transit-peer",
+        "ifname": "eth1",
+        "flags": [
+          "BROADCAST",
+          "MULTICAST",
+          "UP",
+          "LOWER_UP"
+        ],
+        "mtu": 1500,
+        "qdisc": "noqueue",
+        "operstate": "UP",
+        "group": "default",
+        "txqlen": 1000,
+        "addr_info": [
+          {
+            "family": "inet",
+            "local": "198.51.100.1",
+            "prefixlen": 30,
+            "scope": "global",
+            "label": "eth1",
+            "valid_life_time": 4294967295,
+            "preferred_life_time": 4294967295
+          }
+        ]
+      }
+    ]
+  },
+  "installed": {
+    "monotonic_ns": 12515690144,
+    "rib": {
+      "argv": [
+        "vtysh",
+        "-d",
+        "zebra",
+        "-c",
+        "show ip route static json"
+      ],
+      "exit_code": 0,
+      "stdout": {
+        "203.0.113.0/24": [
+          {
+            "protocol": "static",
+            "selected": true,
+            "destSelected": true,
+            "distance": 1,
+            "metric": 0,
+            "installed": true,
+            "nexthopGroupId": 8,
+            "vrfId": 0,
+            "vrfName": "default",
+            "uptime": "00:00:01",
+            "prefix": "203.0.113.0/24",
+            "prefixLen": 24,
+            "table": 254,
+            "internalStatus": 16,
+            "internalFlags": 73,
+            "internalNextHopNum": 1,
+            "internalNextHopActiveNum": 1,
+            "internalNextHopFibInstalledNum": 1,
+            "installedNexthopGroupId": 8,
+            "receivedNexthopGroupId": 8,
+            "nexthops": [
+              {
+                "flags": 3,
+                "fib": true,
+                "ip": "198.51.100.2",
+                "afi": "ipv4",
+                "interfaceIndex": 3,
+                "interfaceName": "eth1",
+                "active": true,
+                "weight": 1
+              }
+            ]
+          }
+        ]
+      }
+    },
+    "kernel": {
+      "argv": [
+        "ip",
+        "-N",
+        "-j",
+        "-4",
+        "route",
+        "show",
+        "table",
+        "main",
+        "exact",
+        "203.0.113.0/24"
+      ],
+      "exit_code": 0,
+      "stdout": [
+        {
+          "dst": "203.0.113.0/24",
+          "nhid": 8,
+          "gateway": "198.51.100.2",
+          "dev": "eth1",
+          "protocol": "196",
+          "metric": 20,
+          "flags": []
+        }
+      ]
+    }
+  },
+  "withdrawn": {
+    "monotonic_ns": 13143400731,
+    "rib": {
+      "argv": [
+        "vtysh",
+        "-d",
+        "zebra",
+        "-c",
+        "show ip route static json"
+      ],
+      "exit_code": 0,
+      "stdout": {}
+    },
+    "kernel": {
+      "argv": [
+        "ip",
+        "-N",
+        "-j",
+        "-4",
+        "route",
+        "show",
+        "table",
+        "main",
+        "exact",
+        "203.0.113.0/24"
+      ],
+      "exit_code": 0,
+      "stdout": []
+    }
+  }
+}

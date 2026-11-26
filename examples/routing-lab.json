@@ -1,0 +1,57 @@
+{
+  "format_version": 2,
+  "id": "routing-lab",
+  "revision": "1",
+  "devices": [
+    { "kind": "host", "id": "pc-a", "name": "PC-A", "ipv4": "192.0.2.10", "prefix_length": 24,
+      "gateway": "192.0.2.1", "mac": "02:00:00:00:00:0a", "port": { "id": "a-eth0", "name": "eth0" } },
+    { "kind": "router", "id": "r1", "name": "R1", "ports": [
+      { "id": "r1-lan", "name": "LAN", "ipv4": "192.0.2.1", "prefix_length": 24, "mac": "02:00:00:00:01:01" },
+      { "id": "r1-r3", "name": "Direct", "ipv4": "198.51.100.1", "prefix_length": 30, "mac": "02:00:00:00:01:02" },
+      { "id": "r1-r2", "name": "Via R2", "ipv4": "198.51.100.5", "prefix_length": 30, "mac": "02:00:00:00:01:03" }
+    ], "routes": [], "link_state": { "peers": [{ "port": "r1-r3", "cost": 5 }, { "port": "r1-r2", "cost": 10 }], "advertise": [] } },
+    { "kind": "router", "id": "r2", "name": "R2", "ports": [
+      { "id": "r2-r1", "name": "Via R1", "ipv4": "198.51.100.6", "prefix_length": 30, "mac": "02:00:00:00:02:01" },
+      { "id": "r2-r3", "name": "Via R3", "ipv4": "198.51.100.9", "prefix_length": 30, "mac": "02:00:00:00:02:02" }
+    ], "routes": [], "link_state": { "peers": [{ "port": "r2-r1", "cost": 10 }, { "port": "r2-r3", "cost": 10 }], "advertise": [] } },
+    { "kind": "router", "id": "r3", "name": "R3", "ports": [
+      { "id": "r3-lan", "name": "LAN", "ipv4": "203.0.113.1", "prefix_length": 24, "mac": "02:00:00:00:03:01" },
+      { "id": "r3-r1", "name": "Direct", "ipv4": "198.51.100.2", "prefix_length": 30, "mac": "02:00:00:00:03:02" },
+      { "id": "r3-r2", "name": "Via R2", "ipv4": "198.51.100.10", "prefix_length": 30, "mac": "02:00:00:00:03:03" }
+    ], "routes": [], "link_state": { "peers": [{ "port": "r3-r1", "cost": 5 }, { "port": "r3-r2", "cost": 10 }], "advertise": ["r3-lan"] } },
+    { "kind": "host", "id": "pc-b", "name": "PC-B", "ipv4": "203.0.113.20", "prefix_length": 24,
+      "gateway": "203.0.113.1", "mac": "02:00:00:00:00:0b", "port": { "id": "b-eth0", "name": "eth0" } }
+  ],
+  "links": [
+    { "id": "a-r1", "ports": ["a-eth0", "r1-lan"], "delay_ns": "100" },
+    { "id": "r1-r3", "ports": ["r1-r3", "r3-r1"], "delay_ns": "100" },
+    { "id": "r1-r2", "ports": ["r1-r2", "r2-r1"], "delay_ns": "100" },
+    { "id": "r2-r3", "ports": ["r2-r3", "r3-r2"], "delay_ns": "100" },
+    { "id": "r3-b", "ports": ["r3-lan", "b-eth0"], "delay_ns": "100" }
+  ],
+  "scenario": {
+    "end_ns": "6100",
+    "arp_lifetime_ns": "1000000000",
+    "mac_lifetime_ns": "1000000000",
+    "routing_convergence_ns": "500",
+    "trace_limit": 128,
+    "warmup": [
+      { "at_ns": "0", "port": "a-eth0", "neighbor": "192.0.2.1" },
+      { "at_ns": "0", "port": "r1-r3", "neighbor": "198.51.100.2" },
+      { "at_ns": "0", "port": "r1-r2", "neighbor": "198.51.100.6" },
+      { "at_ns": "0", "port": "r2-r3", "neighbor": "198.51.100.10" },
+      { "at_ns": "0", "port": "r3-lan", "neighbor": "203.0.113.20" }
+    ],
+    "link_actions": [
+      { "link": "r1-r3", "at_ns": "2400", "state": "down" },
+      { "link": "r1-r3", "at_ns": "4400", "state": "up" }
+    ],
+    "probes": [
+      { "id": "before-install", "source": "pc-a", "destination": "pc-b", "at_ns": "100", "deadline_ns": "900" },
+      { "id": "primary", "source": "pc-a", "destination": "pc-b", "at_ns": "1000", "deadline_ns": "2100" },
+      { "id": "during-update", "source": "pc-a", "destination": "pc-b", "at_ns": "2400", "deadline_ns": "3500" },
+      { "id": "detour", "source": "pc-a", "destination": "pc-b", "at_ns": "3000", "deadline_ns": "4200" },
+      { "id": "recovered", "source": "pc-a", "destination": "pc-b", "at_ns": "5000", "deadline_ns": "6100" }
+    ]
+  }
+}

@@ -1,0 +1,36 @@
+{
+  "id": "ios-native-vlan",
+  "revision": "1",
+  "link_delay_ns": "100",
+  "models": {
+    "pc-a": {
+      "kind": "host", "interface": "eth1", "ipv4": "192.0.2.10", "prefix_length": 24,
+      "mac": "02:00:00:00:00:0a"
+    },
+    "r1": {
+      "kind": "switch", "ports": {
+        "eth1": { "mode": { "kind": "access", "vlan": 10 } },
+        "eth2": { "ios_interface": "GigabitEthernet0/1" }
+      }
+    },
+    "r2": {
+      "kind": "switch", "ports": {
+        "eth1": {
+          "ios_interface": "GigabitEthernet0/2",
+          "ios_config": "interface GigabitEthernet0/2\n switchport mode trunk\n switchport trunk native vlan 20\n switchport trunk allowed vlan 10,20-22"
+        },
+        "eth2": { "mode": { "kind": "access", "vlan": 10 } }
+      }
+    },
+    "pc-b": {
+      "kind": "host", "interface": "eth1", "ipv4": "192.0.2.20", "prefix_length": 24,
+      "mac": "02:00:00:00:00:0b"
+    }
+  },
+  "scenario": {
+    "end_ns": "2000", "arp_lifetime_ns": "10000", "mac_lifetime_ns": "10000",
+    "probes": [
+      { "id": "ping", "source": "pc-a", "destination": "pc-b", "at_ns": "0", "deadline_ns": "2000" }
+    ]
+  }
+}

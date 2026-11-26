@@ -1,0 +1,27 @@
+{
+  "format_version": 2,
+  "id": "acl-lab",
+  "revision": "1",
+  "devices": [
+    { "kind": "host", "id": "pc-a", "name": "PC-A", "ipv4": "192.0.2.10", "prefix_length": 24,
+      "gateway": "192.0.2.1", "mac": "02:00:00:00:00:0a", "port": { "id": "a-eth0", "name": "eth0" } },
+    { "kind": "router", "id": "r1", "name": "R1", "ports": [
+      { "id": "r1-a", "name": "LAN-A", "ipv4": "192.0.2.1", "prefix_length": 24, "mac": "02:00:00:00:01:01",
+        "ipv4_acl": { "egress": [
+          { "action": "deny", "network": "203.0.113.0", "prefix_length": 24 },
+          { "action": "permit", "network": "203.0.113.20", "prefix_length": 32 }
+        ] } },
+      { "id": "r1-b", "name": "LAN-B", "ipv4": "203.0.113.1", "prefix_length": 24, "mac": "02:00:00:00:01:02" }
+    ], "routes": [] },
+    { "kind": "host", "id": "pc-b", "name": "PC-B", "ipv4": "203.0.113.20", "prefix_length": 24,
+      "gateway": "203.0.113.1", "mac": "02:00:00:00:00:0b", "port": { "id": "b-eth0", "name": "eth0" } }
+  ],
+  "links": [
+    { "id": "a-r1", "ports": ["a-eth0", "r1-a"], "delay_ns": "100" },
+    { "id": "r1-b-link", "ports": ["r1-b", "b-eth0"], "delay_ns": "100" }
+  ],
+  "scenario": {
+    "end_ns": "1000", "arp_lifetime_ns": "10000", "mac_lifetime_ns": "10000",
+    "probes": [{ "id": "a-to-b", "source": "pc-a", "destination": "pc-b", "at_ns": "0", "deadline_ns": "1000" }]
+  }
+}

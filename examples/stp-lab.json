@@ -1,0 +1,50 @@
+{
+  "format_version": 2,
+  "id": "stp-lab",
+  "revision": "1",
+  "devices": [
+    { "kind": "host", "id": "pc-a", "name": "PC-A", "ipv4": "192.0.2.10", "prefix_length": 24,
+      "mac": "02:00:00:00:00:0a", "port": { "id": "a-eth0", "name": "eth0" } },
+    { "kind": "switch", "id": "sw1", "name": "SW1", "stp_priority": 4096, "ports": [
+      { "id": "s1-a", "name": "Access", "mode": { "kind": "access", "vlan": 10 } },
+      { "id": "s1-s2", "name": "Via SW2", "mode": { "kind": "trunk", "allowed_vlans": [10, 20] } },
+      { "id": "s1-s3", "name": "Direct", "mode": { "kind": "trunk", "allowed_vlans": [10, 20] } }
+    ] },
+    { "kind": "switch", "id": "sw2", "name": "SW2", "ports": [
+      { "id": "s2-s1", "name": "Via SW1", "mode": { "kind": "trunk", "allowed_vlans": [10, 20] } },
+      { "id": "s2-s3", "name": "Via SW3", "mode": { "kind": "trunk", "allowed_vlans": [10, 20] } }
+    ] },
+    { "kind": "switch", "id": "sw3", "name": "SW3", "ports": [
+      { "id": "s3-s1", "name": "Direct", "stp_cost": 1, "mode": { "kind": "trunk", "allowed_vlans": [20] } },
+      { "id": "s3-s2", "name": "Via SW2", "mode": { "kind": "trunk", "allowed_vlans": [10, 20] } },
+      { "id": "s3-b", "name": "Access", "mode": { "kind": "access", "vlan": 10 } }
+    ] },
+    { "kind": "host", "id": "pc-b", "name": "PC-B", "ipv4": "192.0.2.20", "prefix_length": 24,
+      "mac": "02:00:00:00:00:0b", "port": { "id": "b-eth0", "name": "eth0" } }
+  ],
+  "links": [
+    { "id": "a-s1", "ports": ["a-eth0", "s1-a"], "delay_ns": "100" },
+    { "id": "s1-s2", "ports": ["s1-s2", "s2-s1"], "delay_ns": "100" },
+    { "id": "s1-s3", "ports": ["s1-s3", "s3-s1"], "delay_ns": "100" },
+    { "id": "s2-s3", "ports": ["s2-s3", "s3-s2"], "delay_ns": "100" },
+    { "id": "s3-b", "ports": ["s3-b", "b-eth0"], "delay_ns": "100" }
+  ],
+  "scenario": {
+    "end_ns": "7500",
+    "arp_lifetime_ns": "1000000000",
+    "mac_lifetime_ns": "1000000000",
+    "stp_convergence_ns": "500",
+    "trace_limit": 128,
+    "warmup": [{ "at_ns": "600", "port": "a-eth0", "neighbor": "192.0.2.20" }],
+    "link_actions": [
+      { "link": "s1-s3", "at_ns": "2700", "state": "down" },
+      { "link": "s1-s3", "at_ns": "5500", "state": "up" }
+    ],
+    "probes": [
+      { "id": "initial-tree", "source": "pc-a", "destination": "pc-b", "at_ns": "1500", "deadline_ns": "2500" },
+      { "id": "during-update", "source": "pc-a", "destination": "pc-b", "at_ns": "2700", "deadline_ns": "4000" },
+      { "id": "alternate-tree", "source": "pc-a", "destination": "pc-b", "at_ns": "3500", "deadline_ns": "5200" },
+      { "id": "restored-tree", "source": "pc-a", "destination": "pc-b", "at_ns": "6200", "deadline_ns": "7400" }
+    ]
+  }
+}

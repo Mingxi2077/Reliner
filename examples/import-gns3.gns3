@@ -1,0 +1,21 @@
+{
+  "type": "topology",
+  "name": "Reliner GNS3 structure sample",
+  "project_id": "44444444-4444-4444-8444-444444444444",
+  "revision": 9,
+  "version": "2.2.54",
+  "topology": {
+    "computes": [],
+    "drawings": [],
+    "nodes": [
+      { "node_id": "11111111-1111-4111-8111-111111111111", "name": "PC1", "node_type": "vpcs", "compute_id": "local", "properties": {} },
+      { "node_id": "22222222-2222-4222-8222-222222222222", "name": "PC2", "node_type": "vpcs", "compute_id": "local", "properties": {} }
+    ],
+    "links": [
+      { "link_id": "33333333-3333-4333-8333-333333333333", "nodes": [
+        { "node_id": "11111111-1111-4111-8111-111111111111", "adapter_number": 0, "port_number": 0 },
+        { "node_id": "22222222-2222-4222-8222-222222222222", "adapter_number": 0, "port_number": 0 }
+      ] }
+    ]
+  }
+}

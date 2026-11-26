@@ -1,0 +1,79 @@
+{
+  "format_version": 2,
+  "id": "campus-lab",
+  "revision": "1",
+  "devices": [
+    {"kind": "host", "id": "pc-a", "name": "PC-A", "ipv4": "192.0.2.10", "prefix_length": 24, "gateway": "192.0.2.1", "mac": "02:00:00:00:00:0a", "port": {"id": "a-eth0", "name": "eth0"}},
+    {"kind": "switch", "id": "sw1", "name": "SW1", "stp_priority": 4096, "ports": [
+      {"id": "s1-a", "name": "Access", "mode": {"kind": "access", "vlan": 10}},
+      {"id": "s1-s2", "name": "Via SW2", "mode": {"kind": "trunk", "allowed_vlans": [10, 20]}},
+      {"id": "s1-s3", "name": "Direct", "mode": {"kind": "trunk", "allowed_vlans": [10, 20]}}
+    ]},
+    {"kind": "switch", "id": "sw2", "name": "SW2", "ports": [
+      {"id": "s2-s1", "name": "Via SW1", "mode": {"kind": "trunk", "allowed_vlans": [10, 20]}},
+      {"id": "s2-s3", "name": "Via SW3", "mode": {"kind": "trunk", "allowed_vlans": [10, 20]}}
+    ]},
+    {"kind": "switch", "id": "sw3", "name": "SW3", "ports": [
+      {"id": "s3-s1", "name": "Direct", "stp_cost": 1, "mode": {"kind": "trunk", "allowed_vlans": [20]}},
+      {"id": "s3-s2", "name": "Via SW2", "mode": {"kind": "trunk", "allowed_vlans": [10, 20]}},
+      {"id": "s3-b", "name": "Access", "mode": {"kind": "access", "vlan": 10}}
+    ]},
+    {"kind": "router", "id": "r1", "name": "R1", "ports": [
+      {"id": "r1-lan", "name": "LAN", "ipv4": "192.0.2.1", "prefix_length": 24, "mac": "02:00:00:00:01:01"},
+      {"id": "r1-r3", "name": "Direct", "ipv4": "198.51.100.1", "prefix_length": 30, "mac": "02:00:00:00:01:02"},
+      {"id": "r1-r2", "name": "Via R2", "ipv4": "198.51.100.5", "prefix_length": 30, "mac": "02:00:00:00:01:03"}
+    ], "routes": [], "link_state": {"peers": [{"port": "r1-r3", "cost": 5}, {"port": "r1-r2", "cost": 10}], "advertise": ["r1-lan"]}},
+    {"kind": "router", "id": "r2", "name": "R2", "ports": [
+      {"id": "r2-r1", "name": "Via R1", "ipv4": "198.51.100.6", "prefix_length": 30, "mac": "02:00:00:00:02:01"},
+      {"id": "r2-r3", "name": "Via R3", "ipv4": "198.51.100.9", "prefix_length": 30, "mac": "02:00:00:00:02:02"}
+    ], "routes": [], "link_state": {"peers": [{"port": "r2-r1", "cost": 10}, {"port": "r2-r3", "cost": 10}], "advertise": []}},
+    {"kind": "router", "id": "r3", "name": "R3", "ports": [
+      {"id": "r3-lan", "name": "LAN", "ipv4": "203.0.113.1", "prefix_length": 24, "mac": "02:00:00:00:03:01"},
+      {"id": "r3-r1", "name": "Direct", "ipv4": "198.51.100.2", "prefix_length": 30, "mac": "02:00:00:00:03:02"},
+      {"id": "r3-r2", "name": "Via R2", "ipv4": "198.51.100.10", "prefix_length": 30, "mac": "02:00:00:00:03:03"}
+    ], "routes": [], "link_state": {"peers": [{"port": "r3-r1", "cost": 5}, {"port": "r3-r2", "cost": 10}], "advertise": ["r3-lan"]}},
+    {"kind": "host", "id": "pc-b", "name": "PC-B", "ipv4": "203.0.113.20", "prefix_length": 24, "gateway": "203.0.113.1", "mac": "02:00:00:00:00:0b", "port": {"id": "b-eth0", "name": "eth0"}}
+  ],
+  "links": [
+    {"id": "a-s1", "ports": ["a-eth0", "s1-a"], "delay_ns": "100"},
+    {"id": "s1-s2", "ports": ["s1-s2", "s2-s1"], "delay_ns": "100"},
+    {"id": "s1-s3", "ports": ["s1-s3", "s3-s1"], "delay_ns": "100"},
+    {"id": "s2-s3", "ports": ["s2-s3", "s3-s2"], "delay_ns": "100"},
+    {"id": "s3-r1", "ports": ["s3-b", "r1-lan"], "delay_ns": "100"},
+    {"id": "r1-r3", "ports": ["r1-r3", "r3-r1"], "delay_ns": "100"},
+    {"id": "r1-r2", "ports": ["r1-r2", "r2-r1"], "delay_ns": "100", "transmission": {"rate_bps": "1000000000", "queue_frames": 0}},
+    {"id": "r2-r3", "ports": ["r2-r3", "r3-r2"], "delay_ns": "100"},
+    {"id": "r3-b", "ports": ["r3-lan", "b-eth0"], "delay_ns": "100"}
+  ],
+  "scenario": {
+    "end_ns": "35500",
+    "arp_lifetime_ns": "1000000000",
+    "mac_lifetime_ns": "1000000000",
+    "routing_convergence_ns": "2500",
+    "trace_limit": 1024,
+    "warmup": [
+      {"at_ns": "2700", "port": "a-eth0", "neighbor": "192.0.2.1"},
+      {"at_ns": "0", "port": "r1-r3", "neighbor": "198.51.100.2"},
+      {"at_ns": "0", "port": "r1-r2", "neighbor": "198.51.100.6"},
+      {"at_ns": "0", "port": "r2-r3", "neighbor": "198.51.100.10"},
+      {"at_ns": "0", "port": "r3-lan", "neighbor": "203.0.113.20"},
+      {"at_ns": "5400", "port": "a-eth0", "neighbor": "192.0.2.1"}
+    ],
+    "link_actions": [
+      {"link": "s1-s3", "at_ns": "4500", "state": "down"},
+      {"link": "r1-r3", "at_ns": "9000", "state": "down"},
+      {"link": "r1-r3", "at_ns": "28500", "state": "up"},
+      {"link": "s1-s3", "at_ns": "30000", "state": "up"}
+    ],
+    "probes": [
+      {"id": "vlan", "source": "pc-a", "destination": "pc-b", "at_ns": "3200", "deadline_ns": "4350", "payload_bytes": 56},
+      {"id": "primary", "source": "pc-a", "destination": "pc-b", "at_ns": "6800", "deadline_ns": "8200", "payload_bytes": 56},
+      {"id": "short-deadline", "source": "pc-a", "destination": "pc-b", "at_ns": "8300", "deadline_ns": "8400", "payload_bytes": 56},
+      {"id": "old-route", "source": "pc-a", "destination": "pc-b", "at_ns": "10000", "deadline_ns": "14500", "payload_bytes": 56},
+      {"id": "burst-first", "source": "pc-a", "destination": "pc-b", "at_ns": "17000", "deadline_ns": "22100", "payload_bytes": 56},
+      {"id": "burst-reply", "source": "pc-a", "destination": "pc-b", "at_ns": "17816", "deadline_ns": "22100", "payload_bytes": 0},
+      {"id": "restored", "source": "pc-a", "destination": "pc-b", "at_ns": "33000", "deadline_ns": "35500", "payload_bytes": 56}
+    ],
+    "stp_convergence_ns": "500"
+  }
+}
