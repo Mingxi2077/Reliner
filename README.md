@@ -1,18 +1,48 @@
-# Reliner
+<h1 align="center">
+  <picture>
+    <source media="(max-width: 600px)" srcset="docs/readme-cover-mobile.png">
+    <img src="docs/readme-cover.png" alt="Reliner · 桌面网络拓扑实验室" width="100%">
+  </picture>
+</h1>
 
-Reliner 是面向网络学习者和工程师的轻量拓扑实验与排障工具。在 Windows 桌面画布上搭建拓扑、运行探测，沿证据找到阻断报文的端口或规则。修改配置后，可以重跑同一发探测，对比修复前后的结果。
+<p align="center"><strong>一次 Ping 超时，报文到底停在哪一跳？</strong><br>
+在画布上跟着报文走，点开出问题的端口，改完配置，再跑一次。</p>
 
-**[下载 Windows x64 桌面便携包](https://github.com/Mingxi2077/Reliner/releases/download/desktop-v0.1.0/Reliner-Desktop-0.1.0-Windows-x64.zip)** · [首个桌面里程碑与命令行下载](https://github.com/Mingxi2077/Reliner/releases/tag/desktop-v0.1.0)
-
-![桌面实测：SW2 的 G0/1 端口高亮，诊断面板指出 VLAN 10 未在 Trunk 允许列表中](docs/desktop-vlan-diagnosis.png)
+<p align="center">
+  <a href="https://github.com/Mingxi2077/Reliner/releases/download/desktop-v0.1.0/Reliner-Desktop-0.1.0-Windows-x64.zip"><img src="docs/readme-download.png" width="231" height="43" alt="下载 Windows x64 桌面便携版"></a><br>
+  x64 · 7.91 MB &nbsp;·&nbsp; <a href="https://github.com/Mingxi2077/Reliner/releases/tag/desktop-v0.1.0">发行说明与命令行版</a>
+</p>
 
 ## 从一个 VLAN 故障开始
 
-1. 解压整个桌面 ZIP，双击 `reliner-desktop.exe`。程序使用 Microsoft Edge WebView2 运行时，压缩包内含仿真后端和实验文件。
-2. 在「内置排障关卡」中选择「VLAN Trunk 漏放排障」，点击「运行实验」。PC-A 发出的 ARP 请求在 SW2 的 G0/1 入口被拦截，诊断会指出该端口的允许列表只有 VLAN 20。
-3. 打开这个端口的属性，在 Trunk 允许列表里保留 20、加入 10，然后点击「重跑验证」。同一发探测收到回包后，可以在「对比」里查看两次运行的结果。
+<picture>
+  <source media="(prefers-reduced-motion: reduce)" srcset="docs/desktop-vlan-diagnosis.png">
+  <source media="(max-width: 600px)" srcset="docs/vlan-walkthrough-mobile.gif">
+  <img src="docs/vlan-walkthrough.gif" alt="第一关实机演示：SW2 的 G0/1 拦截了 ARP 请求。放行 VLAN 10 并保留 VLAN 20 后，同一发探测从超时变为连通。" width="100%">
+</picture>
 
-桌面工作区支持多标签编辑、画布连线、表单校验、单步推进和按证据回放。随包示例还包括静态 IPv4、主备切换、MTU、拥塞、动态路由、STP 和 ACL。[桌面使用与开发说明](desktop/README.md)
+1. **打开第一关。** 完整解压 ZIP，双击 `reliner-desktop.exe`，在欢迎页点「开始第 1 关」。便携包自带后端和 11 个实验，桌面界面使用 Microsoft Edge WebView2 运行时。
+2. **顺着红色标记找原因。** 点「运行实验」。PC-A 发出的 ARP 请求停在 **SW2/G0/1**。点诊断里的「打开 SW2/G0/1 端口配置」，可以看到它只放行 VLAN 20。
+3. **改一处，看两次结果。** 打开 VLAN 10 的开关，保留 VLAN 20，点「重跑验证」。在「对比」里，同一发探测从 **2000 ns 超时**变为 **1200 ns 收到回包**。这些时间是仿真时刻。
+
+[看完整桌面截图](docs/desktop-vlan-diagnosis.png) · [打开这份示例拓扑](examples/vlan-lab.json)
+
+## 下一关想查什么？
+
+| 从故障选实验 | 看哪条证据 |
+| --- | --- |
+| [小包能过，大包超时](examples/mtu-lab.json) | 比较实际报文长度和出口 MTU。 |
+| [请求送达，却没有回包](examples/acl-lab.json) | 找到回包被拦的端口，以及命中的 ACL 规则。 |
+| [主链路断了，备用链路也不通](examples/failover-lab.json) | 看哪条链路接管，再查备用口放行了哪些 VLAN。 |
+
+这三个实验都能在桌面的「关卡」中打开。也可以新建空白草图，放入主机、交换机和路由器，自己连线、配置和测通；多张拓扑可以在同一工作区切换。
+
+## 文档与开发
+
+[桌面端使用与构建](desktop/README.md) · [后端命令行](docs/backend-release.md) · [离散事件仿真设计](docs/discrete-event-simulation.md)
+
+<details>
+<summary><strong>实验手册</strong> · 运行命令、配置导入与各关修复步骤</summary>
 
 ## 命令行运行
 
@@ -166,6 +196,11 @@ cargo run --locked -- run examples/mtu-lab.json --json
 
 `short-deadline` 在四个修订中都超时。它的截止早于模型中的往返时间，也没有能证明端口丢弃的证据，报告显示「未定位」。`--json` 可查看请求送达、实际丢弃和各自关联的收敛记录。 [组合规则与验收](docs/discrete-event-simulation.md#组合园区工单)
 
+</details>
+
+<details>
+<summary><strong>架构与桌面接入</strong> · 工作区、诊断证据与接口</summary>
+
 ## 前后端分工
 
 后端提供 `validate_lab` 和 `Workspace::validate_document(document_id, revision)`。校验复用运行前的编译检查，返回首个错误的代码、中文说明、JSON Pointer 和对象 ID，不创建仿真任务。结果绑定本次文档修订；后台编译失败的 `run_summary.input_error` 使用同一诊断。字段解码遇到内部标签枚举时，路径可能只定位到所在设备，界面应显示该容器和原始说明。
@@ -212,6 +247,11 @@ cargo run --locked -- run examples/mtu-lab.json --json
 
 [离散事件仿真设计与答辩记录](docs/discrete-event-simulation.md)包含同刻顺序、表项生命周期、跨网段对照和资源边界。
 
+</details>
+
+<details>
+<summary><strong>性能与归档</strong> · 多拓扑实测、资源上限与历史报告</summary>
+
 ## 多拓扑的资源约束
 
 打开拓扑只载入文档，不启动设备或仿真。只渲染当前标签页的画布，后台标签不各建画布。主动发起的实验共用固定后台工作池。待办受理和运行份额分别限制，单次运行额度固定。达到运行上限时，尚未结案的探测标为「未完成」。前端按需读取当前状态与分批证据。
@@ -239,3 +279,5 @@ cargo run --locked -- run examples/mtu-lab.json --json
 `scripts/package-backend.ps1` 执行格式、静态检查、全部目标测试及发布构建，生成 Windows 后端 ZIP。默认目标为 x64/MSVC，并静态链接 CRT；打包环境须有 Rust 与对应的 Windows 链接库。解压使用方法见[交付说明](docs/backend-release.md)。
 
 历史版本的后端交付记录、验证环境和已知范围见[后端技术栈与复测记录](docs/backend-technology-stack.md)。
+
+</details>
