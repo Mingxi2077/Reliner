@@ -1,0 +1,43 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "Reliner",
+  "version": "0.1.0",
+  "identifier": "dev.reliner.desktop",
+  "build": {
+    "beforeDevCommand": "node scripts/sync-backend.mjs && pnpm dev",
+    "devUrl": "http://127.0.0.1:1420",
+    "beforeBuildCommand": "node scripts/sync-backend.mjs && pnpm build",
+    "frontendDist": "../dist"
+  },
+  "app": {
+    "windows": [
+      {
+        "title": "Reliner · 网络拓扑实验与排障",
+        "width": 1360,
+        "height": 860,
+        "minWidth": 1024,
+        "minHeight": 640,
+        "resizable": true,
+        "theme": "Light"
+      }
+    ],
+    "security": {
+      "csp": null
+    }
+  },
+  "bundle": {
+    "active": true,
+    "targets": "all",
+    "externalBin": [
+      "binaries/reliner"
+    ],
+    "resources": {
+      "../../examples/*.json": "examples/"
+    },
+    "icon": [
+      "icons/32x32.png",
+      "icons/128x128.png",
+      "icons/icon.ico"
+    ]
+  }
+}

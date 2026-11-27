@@ -1,0 +1,21 @@
+[package]
+name = "reliner-desktop"
+version = "0.1.0"
+description = "Reliner 桌面端：轻量级网络拓扑实验与排障工具"
+edition = "2021"
+
+[lib]
+name = "reliner_desktop_lib"
+crate-type = ["rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = [] }
+tauri-plugin-dialog = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[features]
+custom-protocol = ["tauri/custom-protocol"]

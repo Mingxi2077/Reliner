@@ -1,12 +1,22 @@
 # Reliner
 
-Reliner 是面向网络学习者和从业者的轻量拓扑实验与排障工具。主线是 **搭拓扑 → 测连通 → 找故障 → 改配置并重跑**。失败时，第一屏讲清发生了什么、在哪里发生、下一步能做什么；逐跳事件和配置依据按需展开。初学者不用先学命令，工程师也不用切换到另一套界面才能查证据。
+Reliner 是面向网络学习者和工程师的轻量拓扑实验与排障工具。在 Windows 桌面画布上搭建拓扑、运行探测，沿证据找到阻断报文的端口或规则。修改配置后，可以重跑同一发探测，对比修复前后的结果。
 
-**VLAN、静态 IPv4、双链路主备、IPv4 MTU、链路队列、点到点动态路由和 STP 排障已在 Windows 本机跑通。** Rust 核心和命令行支持同一场景多次探测，记录实际阻断和触发切换的事件。
+**[下载 Windows x64 桌面便携包](https://github.com/Mingxi2077/Reliner/releases/download/desktop-v0.1.0/Reliner-Desktop-0.1.0-Windows-x64.zip)** · [首个桌面里程碑与命令行下载](https://github.com/Mingxi2077/Reliner/releases/tag/desktop-v0.1.0)
 
-## 运行第一个实验
+![桌面实测：SW2 的 G0/1 端口高亮，诊断面板指出 VLAN 10 未在 Trunk 允许列表中](docs/desktop-vlan-diagnosis.png)
 
-当前交付 Windows x64 命令行后端，桌面图形界面待接入。解压 Windows 后端 ZIP 后，在该目录运行：
+## 从一个 VLAN 故障开始
+
+1. 解压整个桌面 ZIP，双击 `reliner-desktop.exe`。程序使用 Microsoft Edge WebView2 运行时，压缩包内含仿真后端和实验文件。
+2. 在「内置排障关卡」中选择「VLAN Trunk 漏放排障」，点击「运行实验」。PC-A 发出的 ARP 请求在 SW2 的 G0/1 入口被拦截，诊断会指出该端口的允许列表只有 VLAN 20。
+3. 打开这个端口的属性，在 Trunk 允许列表里保留 20、加入 10，然后点击「重跑验证」。同一发探测收到回包后，可以在「对比」里查看两次运行的结果。
+
+桌面工作区支持多标签编辑、画布连线、表单校验、单步推进和按证据回放。随包示例还包括静态 IPv4、主备切换、MTU、拥塞、动态路由、STP 和 ACL。[桌面使用与开发说明](desktop/README.md)
+
+## 命令行运行
+
+桌面包内的 `reliner.exe` 也可独立使用。在解压目录打开终端运行：
 
 ```powershell
 .\reliner.exe run .\examples\vlan-lab.json
@@ -165,7 +175,7 @@ cargo run --locked -- run examples/mtu-lab.json --json
 | 部分 | 技术与职责 |
 | --- | --- |
 | 后端 · 开发主线 | Rust + Cargo；用 Serde 读写版本化 JSON。负责拓扑、配置校验、实验执行、证据与结果对比。核心独立于界面，CLI 调用核心库，桌面端可以通过 `Workspace` 复用文档、实验和结果接口。 |
-| 前端 · 交接参考 | Tauri 2 + React / TypeScript，拓扑用 Canvas 2D 绘制，配置用普通表单。负责拖拽、选中、缩放、表单和结果展示，不自行推断故障原因。 |
+| 桌面客户端 | Tauri 2 + React / TypeScript，拓扑用 Canvas 2D 绘制。负责设备与端口编辑、运行控制、故障高亮和结果对比，直接展示后端返回的判定及证据。 |
 
 桌面端按文档 ID 读取 `document`，编辑时带上当前文档修订。画布修改走 `replace_presentation`，配置修改走 `replace_experiment`。「测连通」调用 `submit_run`，「保存并重跑」调用 `save_and_rerun`。两者都返回运行 ID 和绑定的生效修订。保存成功但待办已满时，在同一条反馈里分别显示保存结果和运行受理结果。
 
@@ -174,6 +184,13 @@ cargo run --locked -- run examples/mtu-lab.json --json
 对已产生报告的终态，`run_summary.probe_counts` 给出已结案、连通、超时、发包前拒绝与未完成数。额度终止时读 `stop_reason` 和 `stop_limit`，用 `last_event_id` 判断是否已有事件提交。排队取消或输入编译失败时没有探测计数。CLI 场景未完成时把同样的摘要放在明细前。
 
 动态路由表事件通过 `run_routing_event_page` 查询，树和端口角色通过 `run_stp_event_page` 分页。证据带 `stp_event_id` 时，可用该次运行 ID 与 `run_stp_event` 直接回查对应树，再按失败时的实际端口与方向高亮。
+
+## 桌面端与后端接入
+
+1. **运行方式。** Tauri 的 Rust 层管理一个常驻的 `reliner.exe workspace --jsonl` 子进程。所有拓扑标签共享一次 `hello` 握手和同一个工作区。关闭应用时一并关闭后端。
+2. **目录。** 桌面端放在同仓的 `desktop/`，其中 `desktop/src/` 放界面、画布和客户端，`desktop/src-tauri/` 放桌面入口、子进程通信和打包配置。根目录的 Cargo 项目负责仿真后端，桌面可以单独构建。
+3. **首期范围。** 交付原生文档的新建、打开、保存、多标签切换，设备与连线编辑，配置表单与校验定位，探测、暂停、单步与继续，故障证据和端口高亮，以及保存重跑和按探测 ID 对比。新建通过 `document.open` 传初始原生文档；拖动时本地更新画布，放下时提交布局。界面按需读取证据，保留修订冲突和保存冲突时的草稿。
+4. **当前边界。** Containerlab、GNS3、IOS 导入，LLDP 核对和历史归档回查可通过命令行使用。真实桌面打开 64 份文档时的拖动与切页延迟待实测，文末的多拓扑指标来自后端工作区。
 
 ## 前端交接：一条排障路径
 
@@ -221,4 +238,4 @@ cargo run --locked -- run examples/mtu-lab.json --json
 
 `scripts/package-backend.ps1` 执行格式、静态检查、全部目标测试及发布构建，生成 Windows 后端 ZIP。默认目标为 x64/MSVC，并静态链接 CRT；打包环境须有 Rust 与对应的 Windows 链接库。解压使用方法见[交付说明](docs/backend-release.md)。
 
-首版交付包位于 `dist/reliner-backend-x86_64-pc-windows-msvc.zip`，包含独立程序与八份示例。137 项测试在 GNU、MSVC Release 上各连续通过三轮。解压后已在非提权、仅系统 PATH 环境中重复执行校验、实验与归档回查。当前交接范围是原生模型后端与 CLI；前端接入、第三方配置转换、Linux 实栈及真实协议对照沿已有条件按工单扩展。
+历史版本的后端交付记录、验证环境和已知范围见[后端技术栈与复测记录](docs/backend-technology-stack.md)。
