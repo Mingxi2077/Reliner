@@ -52,6 +52,7 @@ try {
     Copy-Item -LiteralPath (Join-Path $projectRoot 'examples\lldp-peer.pcap') -Destination (Join-Path $stageRoot 'examples')
     Copy-Item -LiteralPath (Join-Path $projectRoot 'examples\capture-frr-route.py') -Destination (Join-Path $stageRoot 'examples')
     Copy-Item -LiteralPath (Join-Path $projectRoot 'docs\backend-release.md') -Destination (Join-Path $stageRoot 'README.md')
+    Copy-Item -LiteralPath (Join-Path $projectRoot 'LICENSE') -Destination $stageRoot
     [void][IO.Directory]::CreateDirectory($outputRoot)
     Add-Type -AssemblyName System.IO.Compression.FileSystem
     [IO.Compression.ZipFile]::CreateFromDirectory($stageRoot, $archivePath)

@@ -10,7 +10,7 @@
 
 <p align="center">
   <a href="https://github.com/Mingxi2077/Reliner/releases/download/desktop-v0.1.0/Reliner-Desktop-0.1.0-Windows-x64.zip"><img src="docs/readme-download.png" width="231" height="43" alt="下载 Windows x64 桌面便携版"></a><br>
-  x64 · 7.91 MB &nbsp;·&nbsp; <a href="https://github.com/Mingxi2077/Reliner/releases/tag/desktop-v0.1.0">发行说明与命令行版</a>
+  x64 · 7.91 MB &nbsp;·&nbsp; <a href="https://github.com/Mingxi2077/Reliner/releases/tag/desktop-v0.1.0">发行说明与命令行版</a> &nbsp;·&nbsp; <a href="LICENSE">Apache-2.0 许可证</a>
 </p>
 
 ## 从一个 VLAN 故障开始

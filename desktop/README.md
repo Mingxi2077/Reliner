@@ -43,6 +43,8 @@ pnpm tauri dev
 pnpm tauri build
 ```
 
+手工制作桌面便携 ZIP 时，将仓库根目录的 [LICENSE](../LICENSE) 放到压缩包根目录。Tauri 安装包通过资源配置随附同一份许可证。
+
 ## 首期交付范围
 
 - 多文档工作区：新建、打开本地 JSON、打开内置示例副本、保存、另存为、关闭未保存提醒、`stale_revision` 与 `save_conflict` 处理
