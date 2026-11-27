@@ -75,6 +75,100 @@ fn global_tagging_applies_across_the_file() {
 }
 
 #[test]
+fn interface_native_tagging_keeps_the_same_provenance_as_device_preview() {
+    let header = "interface Gi0/1\n switchport mode trunk\n switchport trunk allowed vlan 10";
+    let vlan = "switchport trunk native vlan 10";
+    let tag = "switchport trunk native vlan tag";
+    for (prefix, tag_first) in [("", false), ("no ", true), ("default ", false)] {
+        let (config, tag_line, vlan_line) = if tag_first {
+            (format!("{header}\n {prefix}{tag}\n {vlan}"), 4, 5)
+        } else {
+            (format!("{header}\n {vlan}\n {prefix}{tag}"), 5, 4)
+        };
+        let single = serde_json::to_value(reliner::preview_ios(&config).unwrap()).unwrap();
+        let whole = preview(&config);
+        let port = &whole["interfaces"][0];
+        assert_eq!(single["mode"], json!({"kind":"trunk","allowed_vlans":[10]}));
+        assert_eq!(single["field_lines"], json!({"kind":2,"allowed_vlans":3}));
+        assert_eq!(
+            single["context"],
+            json!({
+                "native_tagging_override_line":tag_line,
+                "configured_native_vlan":{"value":10,"line":vlan_line}
+            })
+        );
+        for field in ["mode", "field_lines", "context"] {
+            assert_eq!(single[field], port[field]);
+        }
+        let gaps: Vec<_> = single["gaps"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|g| g["field"] != "device_context")
+            .cloned()
+            .collect();
+        assert_eq!(gaps.len(), 2);
+        assert_eq!(json!(gaps), port["gaps"]);
+        for field in ["native_tagging", "native_vlan"] {
+            assert!(
+                gaps.iter()
+                    .any(|g| g["field"] == field && g["line"] == tag_line)
+            );
+        }
+    }
+}
+
+#[test]
+fn interface_tagging_gaps_and_configured_vlan_survive_import_and_archive() {
+    let config = "interface Gi0/1\n switchport mode trunk\n switchport trunk allowed vlan 10\n switchport trunk native vlan tag\n switchport trunk native vlan 10";
+    let mut opts = options(
+        config,
+        json!({
+            "Gi0/1":{"ios_config":config}, "cable":{"mode":{"kind":"access","vlan":10}}
+        }),
+    );
+    opts.models
+        .get_mut("sw")
+        .unwrap()
+        .as_object_mut()
+        .unwrap()
+        .remove("ios_device_config");
+    let native = import_containerlab(SOURCE, &opts).unwrap();
+    let doc: Value = serde_json::from_str(&native).unwrap();
+    let source = &doc["import_source"];
+    let path = "/models/sw/ports/Gi0~11/ios_config";
+    let metadata = &source["metadata"][path];
+    assert_eq!(
+        metadata["context"]["configured_native_vlan"],
+        json!({"value":10,"line":5})
+    );
+    assert_eq!(metadata["context"]["native_tagging_override_line"], 4);
+    assert!(metadata["mode"].get("native_vlan").is_none());
+    let gaps: Vec<_> = source["gaps"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|g| g["source_path"] == format!("{path}/lines/4"))
+        .collect();
+    assert_eq!(gaps.len(), 2);
+    assert_ne!(gaps[0]["id"], gaps[1]["id"]);
+    assert!(
+        gaps.iter()
+            .all(|g| g["scope"] == json!({"kind":"port","port_id":"sw:Gi0/1"}))
+    );
+    let report = run_lab(&native).unwrap();
+    let mut archive = Vec::new();
+    reliner::write_archive(&report, None, None, &mut archive).unwrap();
+    let saved = serde_json::to_value(reliner::read_archive(&archive[..]).unwrap().report).unwrap();
+    assert_eq!(saved["import_source"], *source);
+    assert_eq!(saved["probes"][0]["outcome"]["status"], "undetermined");
+    assert_eq!(
+        saved["probes"][0]["outcome"]["modeled"]["status"],
+        "timeout"
+    );
+}
+
+#[test]
 fn ambiguous_or_broken_config_reports_original_lines_without_payloads() {
     for (source, line) in [
         ("interface Gi00/01\n!\ninterface GigabitEthernet0/1", 3),

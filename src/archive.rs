@@ -389,6 +389,7 @@ fn outcome_time(outcome: Outcome) -> u64 {
 }
 
 struct References<'a> {
+    model_version: u32,
     evidence: HashMap<u64, (&'a str, &'a Evidence)>,
     frame_acls: HashMap<(&'a str, u64), &'a Evidence>,
     links: HashMap<u64, &'a LinkEvent>,
@@ -399,8 +400,9 @@ struct References<'a> {
 }
 
 impl<'a> References<'a> {
-    fn new() -> Self {
+    fn new(model_version: u32) -> Self {
         Self {
+            model_version,
             evidence: HashMap::new(),
             frame_acls: HashMap::new(),
             links: HashMap::new(),
@@ -528,12 +530,18 @@ impl<'a> References<'a> {
                 let evidence = self.evidence(id, probe, &format!("{path}/cause"))?;
                 if matches!(
                     evidence.fact,
-                    EvidenceFact::Ipv4AclDecision {
-                        action: crate::Ipv4AclAction::Permit,
-                        ..
-                    }
+                    EvidenceFact::ArpResolved
+                        | EvidenceFact::EchoRequestReceived
+                        | EvidenceFact::EchoReplyReceived
+                        | EvidenceFact::Ipv4AclDecision {
+                            action: Ipv4AclAction::Permit,
+                            ..
+                        }
                 ) {
-                    return Err(invalid(format!("{path}/cause 引用了 ACL 放行事实。")));
+                    return Err(invalid(format!(
+                        "{path}/cause 引用的证据 {} 不是阻断事实。",
+                        id.0
+                    )));
                 }
                 if evidence.at_ns > at_ns {
                     return Err(invalid(format!("{path}/cause 晚于探测结案。")));
@@ -555,12 +563,16 @@ impl<'a> References<'a> {
         }
     }
 
-    fn check_acl_parent(
+    fn check_frame_parent(
         &self,
         probe: &str,
         frame: FrameEvidence,
         path: &str,
     ) -> Result<(), ArchiveError> {
+        // Through model 13 an immediate outgoing drop could reuse its incoming ID.
+        if self.model_version >= 14 && frame.parent_id == Some(frame.id) {
+            return Err(invalid(format!("{path}/frame/parent_id 指向帧自身。")));
+        }
         // Every provable chain from a denied frame includes its first retained edge.
         if frame
             .parent_id
@@ -585,7 +597,7 @@ impl<'a> References<'a> {
         if let Some(parent) = evidence.frame.parent_id {
             nonzero(parent.0, &format!("{path}/frame/parent_id"))?;
         }
-        self.check_acl_parent(probe, evidence.frame, path)?;
+        self.check_frame_parent(probe, evidence.frame, path)?;
         if !matches!(evidence.fact, EvidenceFact::Ipv4AclDecision { .. })
             && self.denied_at(probe, evidence.frame.id).is_some()
         {
@@ -761,7 +773,10 @@ fn check_link_member(
 }
 
 fn validate_report(report: &RunReport, trace: Option<&TraceReport>) -> Result<(), ArchiveError> {
-    let mut refs = References::new();
+    let mut refs = References::new(match report {
+        RunReport::Legacy(report) => report.model_version,
+        RunReport::Scenario(report) => report.model_version,
+    });
     match report {
         RunReport::Legacy(report) => {
             if report.report_version != 1 {
@@ -1049,7 +1064,7 @@ fn validate_trace(
             return Err(invalid(format!("{path}/probe_id 引用了未知探测 {probe}。")));
         }
         if let (Some(probe), Some(frame)) = (&entry.probe_id, entry.frame) {
-            refs.check_acl_parent(probe, frame, &path)?;
+            refs.check_frame_parent(probe, frame, &path)?;
             if let Some(stage) = refs.denied_at(probe, frame.id)
                 && let Some(route) = &entry.route
                 && (stage == PortStage::Ingress || route.ipv4_mtu.is_some())

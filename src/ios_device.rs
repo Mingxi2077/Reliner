@@ -4,9 +4,10 @@ use std::collections::{BTreeMap, BTreeSet};
 use serde::Serialize;
 use serde_json::{Map, Value, json};
 
-use crate::importer::{child, gap, mapping_error, source_error};
+use crate::importer::{child, mapping_error, source_error};
 use crate::ios::{
     DEVICE_VLAN_ENTRIES, IosGap, IosInterface, allowed_vlans, canonical_port, merge_mode,
+    record_issue,
 };
 use crate::{ImportError, ImportScope, ImportSource};
 
@@ -416,40 +417,17 @@ fn parse_device(
     if !has_command {
         return Err(source_error(path, "配置中没有设备命令。"));
     }
-    let tagging = &device.global;
+    let global_tag_line = device
+        .global
+        .native_tagging_lines
+        .last()
+        .copied()
+        .filter(|_| device.global.native_tagging != Some(false));
     for port in &mut device.interfaces {
         let before = port.parsed.gaps.len();
-        if !tagging.native_tagging_lines.is_empty() && tagging.native_tagging != Some(false)
-            || port.context.contains_key("native_tagging_override_line")
-        {
-            if let Some(value) = port.parsed.mode.remove("native_vlan") {
-                let line = port.parsed.field_lines.remove("native_vlan").unwrap();
-                port.context.insert(
-                    "configured_native_vlan".into(),
-                    json!({"value":value,"line":line}),
-                );
-            }
-            if port.parsed.mode.get("kind").and_then(Value::as_str) != Some("access") {
-                let line = port
-                    .context
-                    .get("native_tagging_override_line")
-                    .and_then(Value::as_u64)
-                    .map(|n| n as usize)
-                    .or_else(|| tagging.native_tagging_lines.last().copied());
-                port.parsed.gaps.push(issue(
-                    line,
-                    "native_vlan",
-                    "Native VLAN 标记配置影响未标记转发，未导入未标记 VLAN。",
-                ));
-            }
-        }
-        let kind = port
-            .parsed
-            .mode
-            .get("kind")
-            .and_then(Value::as_str)
-            .map(str::to_owned);
-        port.parsed.require_mode_fields(kind.as_deref());
+        port.parsed.finish(global_tag_line);
+        // Whole-device provenance groups these values with the other port facts.
+        port.context.append(&mut port.parsed.context);
         budget.charge_gaps(port.parsed.gaps.len() - before, path, Some(port.line))?;
     }
     budget.charge_gaps(1, path, Some(last_line))?;
@@ -525,20 +503,6 @@ fn port_command(
             .unwrap()
             .push(json!({"line":line,"value":value}));
     }
-    let positive = words
-        .strip_prefix(&["no"])
-        .or_else(|| words.strip_prefix(&["default"]))
-        .unwrap_or(words);
-    if positive.starts_with(&["switchport", "trunk", "native", "vlan", "tag"]) {
-        port.context
-            .insert("native_tagging_override_line".into(), json!(line));
-        port.parsed.gaps.push(issue(
-            Some(line),
-            "native_tagging",
-            "接口 Native VLAN 标记覆盖未映射。",
-        ));
-        return Ok(());
-    }
     port.parsed.command(words, vlan_entries, line, path)
 }
 
@@ -571,33 +535,6 @@ fn compact_port_provenance(port: &mut IosDevicePort) {
     }
     port.context
         .insert("allowed_vlan_list".into(), Value::String(list));
-}
-
-fn record_issue(
-    source: &mut ImportSource,
-    occurrences: &mut BTreeMap<String, usize>,
-    path: &str,
-    fallback: &str,
-    scope: ImportScope,
-    issue: &IosGap,
-) {
-    let location = issue.line.map_or_else(
-        || child(fallback, issue.field),
-        |line| format!("{path}/lines/{line}"),
-    );
-    gap(
-        source,
-        &location,
-        scope,
-        &json!({"field":issue.field,"line":issue.line}),
-        issue.message,
-    );
-    let count = occurrences.entry(location).or_default();
-    *count += 1;
-    if *count > 1 {
-        let last = source.gaps.last_mut().expect("just added this gap");
-        last.id.push_str(&format!("#{count}"));
-    }
 }
 
 pub(crate) fn apply_device(

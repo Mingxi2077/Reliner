@@ -822,6 +822,81 @@ fn saving_succeeds_even_when_rerun_is_rejected_and_io_failure_does_not_submit() 
 }
 
 #[test]
+fn competing_jsonl_processes_report_a_disk_conflict() {
+    use std::{
+        io::{BufRead, BufReader, Write},
+        process::{Command, Stdio},
+        sync::Barrier,
+    };
+
+    let file = TemporaryFile::new();
+    fs::write(&file.0, VLAN).unwrap();
+    let path = &file.0;
+    let clients = [17, 19].map(|x| {
+        let mut child = Command::new(env!("CARGO_BIN_EXE_reliner"))
+            .args(["workspace", "--jsonl"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let mut input = child.stdin.take().unwrap();
+        let mut output = BufReader::new(child.stdout.take().unwrap());
+        let mut session = Value::Null;
+        let mut call = move |cmd: Value| {
+            writeln!(
+                input,
+                "{}",
+                json!({"protocol_version":1,"request_id":"1","session_id":session,"command":cmd})
+            )
+            .unwrap();
+            let mut line = String::new();
+            output.read_line(&mut line).unwrap();
+            let response: Value = serde_json::from_str(&line).unwrap();
+            session = response["session_id"].clone();
+            response
+        };
+        assert_eq!(call(json!({"type":"hello"}))["status"], "ok");
+        let opened = call(json!({"type":"document.open","path":file.0}));
+        assert_eq!(opened["status"], "ok", "{opened}");
+        let id = opened["data"]["id"].clone();
+        let edited = call(
+            json!({"type":"document.replace_presentation","document_id":id,
+            "expected_revision":"1","presentation":format!(r#"{{"x":{x}}}"#)}),
+        );
+        assert_eq!(edited["status"], "ok", "{edited}");
+        move |start: &Barrier| {
+            start.wait();
+            let response = call(json!({"type":"document.save","document_id":id,
+                "expected_revision":"2","path":path}));
+            drop(call);
+            assert!(child.wait().unwrap().success());
+            response
+        }
+    });
+    let start = Barrier::new(2);
+    let [a, b] = clients;
+    let results = thread::scope(|scope| {
+        let first = scope.spawn(|| a(&start));
+        let second = b(&start);
+        [first.join().unwrap(), second]
+    });
+    assert_eq!(
+        results.iter().filter(|r| r["status"] == "ok").count(),
+        1,
+        "{results:?}"
+    );
+    let winner = results.iter().position(|r| r["status"] == "ok").unwrap();
+    let error = &results[1 - winner]["error"];
+    assert_eq!(error["code"], "save_conflict", "{error}");
+    assert_eq!(
+        error["details"]["path"],
+        json!(fs::canonicalize(&file.0).unwrap())
+    );
+    let disk: Value = serde_json::from_slice(&fs::read(&file.0).unwrap()).unwrap();
+    assert_eq!(disk["presentation"]["x"], [17, 19][winner]);
+}
+
+#[test]
 fn saved_rerun_and_reopened_file_keep_the_same_saved_input() {
     let destination = TemporaryFile::new();
     let mut client = Client::new();

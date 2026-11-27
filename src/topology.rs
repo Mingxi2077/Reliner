@@ -1,6 +1,6 @@
 use std::collections::{HashMap, HashSet};
 use std::net::Ipv4Addr;
-use std::num::{NonZeroU32, NonZeroU64, NonZeroUsize};
+use std::num::{NonZeroU32, NonZeroU64};
 
 use serde::{Deserialize, Deserializer, de};
 
@@ -377,6 +377,18 @@ impl Interface {
     pub(crate) fn can_resolve(self, ip: Ipv4Addr) -> bool {
         self.ipv4 != ip && self.on_link(ip) && usable_ipv4(ip, self.prefix_length)
     }
+
+    pub(crate) fn host_next_hop(
+        self,
+        destination: Ipv4Addr,
+        gateway: Option<Ipv4Addr>,
+    ) -> Option<Ipv4Addr> {
+        if self.on_link(destination) {
+            Some(destination)
+        } else {
+            gateway
+        }
+    }
 }
 
 pub(crate) enum DeviceKind {
@@ -470,10 +482,11 @@ impl Route {
 }
 
 #[derive(Default)]
-struct Vertex {
+struct Vertex<G> {
     component: usize,
     entry: usize,
     end: usize,
+    root_generation: G,
 }
 
 #[derive(Clone, Copy)]
@@ -518,12 +531,12 @@ pub(crate) struct Warmup {
     pub(crate) at_ns: u64,
 }
 
-pub(crate) struct ForwardingForest {
-    vertices: Vec<Vertex>,
+pub(crate) struct ForwardingForest<G = ()> {
+    vertices: Vec<Vertex<G>>,
     children: Vec<Option<usize>>,
 }
 
-impl ForwardingForest {
+impl<G> ForwardingForest<G> {
     pub(crate) fn entries(&self) -> usize {
         self.vertices.len() + self.children.len()
     }
@@ -543,7 +556,7 @@ impl ForwardingForest {
         if source.component != child.component || target.component != child.component {
             return false;
         }
-        let inside = |vertex: &Vertex| (child.entry..child.end).contains(&vertex.entry);
+        let inside = |vertex: &Vertex<G>| (child.entry..child.end).contains(&vertex.entry);
         inside(source) != inside(target)
             && (inside(source) == inside(&self.vertices[from])) == (stage == PortStage::Egress)
     }
@@ -552,56 +565,42 @@ impl ForwardingForest {
 pub(crate) struct StpForestPlan {
     adjacency: Vec<Vec<(usize, usize)>>,
     managed_slots: Vec<Option<usize>>,
-    port_slots: Vec<Option<NonZeroUsize>>,
-    link_slots: Vec<Option<NonZeroUsize>>,
+    port_slots: HashMap<PortIndex, usize>,
+    link_slots: HashMap<LinkIndex, usize>,
 }
 
 impl StpForestPlan {
     pub(crate) fn compile(
-        device_count: usize,
         ports: &[Port],
-        links: &[Link],
+        links: &[(LinkIndex, [PortIndex; 2])],
         managed_slot: impl Fn(LinkIndex) -> Option<usize>,
     ) -> Self {
-        let mut controlled_switches = vec![false; device_count];
-        for (index, link) in links.iter().enumerate() {
-            if managed_slot(index).is_some() {
-                for port in link.ports {
-                    controlled_switches[ports[port].device] = true;
-                }
-            }
-        }
-        let mut switches = vec![None; device_count];
-        let mut port_slots = vec![None; ports.len()];
-        let mut link_slots = vec![None; links.len()];
-        let mut edges = Vec::new();
-        let mut managed_slots = Vec::new();
+        // Index only this domain. Each IP interface is a separate leaf, including router ports.
+        let mut switches = HashMap::new();
+        let mut port_slots = HashMap::new();
+        let mut link_slots = HashMap::new();
+        let mut edges = Vec::with_capacity(links.len());
+        let mut managed_slots = Vec::with_capacity(links.len());
         let mut vertices = 0;
         let mut add_vertex = || {
+            let slot = vertices;
             vertices += 1;
-            NonZeroUsize::new(vertices).expect("nonzero vertex slot")
+            slot
         };
-        for (index, link) in links.iter().enumerate() {
-            if !link
-                .ports
-                .iter()
-                .any(|&port| controlled_switches[ports[port].device])
-            {
-                continue;
-            }
-            let endpoints = link.ports.map(|port| {
+        for &(index, ends) in links {
+            let endpoints = ends.map(|port| {
                 let slot = match ports[port].kind {
-                    PortKind::Switch(_) => {
-                        *switches[ports[port].device].get_or_insert_with(&mut add_vertex)
-                    }
+                    PortKind::Switch(_) => *switches
+                        .entry(ports[port].device)
+                        .or_insert_with(&mut add_vertex),
                     PortKind::Ip(_) => add_vertex(),
                 };
-                port_slots[port] = Some(slot);
-                slot.get() - 1
+                port_slots.insert(port, slot);
+                slot
             });
+            link_slots.insert(index, edges.len());
             edges.push(endpoints);
             managed_slots.push(managed_slot(index));
-            link_slots[index] = NonZeroUsize::new(edges.len());
         }
         let adjacency = forest_adjacency(vertices, edges.into_iter().enumerate());
         Self {
@@ -617,33 +616,62 @@ impl StpForestPlan {
         4 * self.adjacency.len() + 3 * self.managed_slots.len()
     }
 
-    pub(crate) fn build(&self, forwarding: &[bool]) -> ForwardingForest {
-        index_forest(&self.adjacency, self.managed_slots.len(), |slot| {
-            self.managed_slots[slot].is_none_or(|index| forwarding[index])
-        })
+    pub(crate) fn build(
+        &self,
+        forwarding: &[bool],
+        previous: Option<&ForwardingForest<u64>>,
+    ) -> ForwardingForest<u64> {
+        index_forest(
+            &self.adjacency,
+            self.managed_slots.len(),
+            |slot| self.managed_slots[slot].is_none_or(|index| forwarding[index]),
+            |root| {
+                previous.map_or(0, |old| {
+                    old.vertices[old.vertices[root].component].root_generation
+                })
+            },
+        )
         .expect("the elected forwarding links form a forest")
     }
 
+    pub(crate) fn mac_generation(&self, forest: &ForwardingForest<u64>, port: PortIndex) -> u64 {
+        self.port_slots.get(&port).map_or(0, |&slot| {
+            let component = forest.vertices[slot].component;
+            forest.vertices[component].root_generation
+        })
+    }
+
+    pub(crate) fn invalidate_macs(
+        &self,
+        forest: &mut ForwardingForest<u64>,
+        ports: [PortIndex; 2],
+        generation: u64,
+    ) {
+        // A removed edge can split the old tree. Both resulting components changed.
+        for port in ports {
+            let slot = self.port_slots[&port];
+            let component = forest.vertices[slot].component;
+            forest.vertices[component].root_generation = generation;
+        }
+    }
+
     fn slot(&self, link: LinkIndex) -> Option<usize> {
-        self.link_slots[link].map(|slot| slot.get() - 1)
+        self.link_slots.get(&link).copied()
     }
 
     fn on_required_branch(
         &self,
-        forest: &ForwardingForest,
+        forest: &ForwardingForest<u64>,
         link_slot: usize,
         ports: [PortIndex; 3],
         stage: PortStage,
     ) -> bool {
-        let [Some(source), Some(target), Some(from)] = ports.map(|port| self.port_slots[port])
+        let [Some(source), Some(target), Some(from)] =
+            ports.map(|port| self.port_slots.get(&port).copied())
         else {
             return false;
         };
-        forest.on_required_branch(
-            link_slot,
-            [source.get() - 1, target.get() - 1, from.get() - 1],
-            stage,
-        )
+        forest.on_required_branch(link_slot, [source, target, from], stage)
     }
 }
 
@@ -1360,7 +1388,7 @@ impl Topology {
 
     pub(crate) fn on_required_branch(
         &self,
-        stp_forest: Option<&ForwardingForest>,
+        stp_forest: Option<(&StpForestPlan, &ForwardingForest<u64>)>,
         source: PortIndex,
         target: Ipv4Addr,
         from: PortIndex,
@@ -1372,13 +1400,10 @@ impl Topology {
         let Some(attached) = self.ports[from].link else {
             return false;
         };
-        if let Some(forest) = stp_forest
-            && let Some(plan) = self.stp.as_ref()
-            && let Some(slot) = plan.forest.slot(attached.link)
+        if let Some((plan, forest)) = stp_forest
+            && let Some(slot) = plan.slot(attached.link)
         {
-            return plan
-                .forest
-                .on_required_branch(forest, slot, [source, target, from], stage);
+            return plan.on_required_branch(forest, slot, [source, target, from], stage);
         }
         let vertices =
             [source, target, from].map(|port| port_vertex(self.devices.len(), &self.ports, port));
@@ -1695,7 +1720,7 @@ fn forwarding_forest(
             )
         });
     let adjacency = forest_adjacency(device_count + ports.len(), edges);
-    let mut forest = index_forest(&adjacency, links.len(), |_| true).map_err(|link| {
+    let mut forest = index_forest(&adjacency, links.len(), |_| true, |_| ()).map_err(|link| {
         let [a, b] = links[link].ports;
         InputError::new(format!(
             "端口 {} 与 {} 的连接使二层拓扑形成环路。",
@@ -1723,11 +1748,12 @@ fn forest_adjacency(
     adjacency
 }
 
-fn index_forest(
+fn index_forest<G: Default>(
     adjacency: &[Vec<(usize, usize)>],
     link_count: usize,
     active: impl Fn(usize) -> bool,
-) -> Result<ForwardingForest, usize> {
+    root_generation: impl Fn(usize) -> G,
+) -> Result<ForwardingForest<G>, usize> {
     // Each IP interface is a leaf. Router ports never bridge two Ethernet segments.
     let mut vertices: Vec<_> = (0..adjacency.len()).map(|_| Vertex::default()).collect();
     let mut children = vec![None; link_count];
@@ -1752,7 +1778,7 @@ fn index_forest(
             vertices[vertex] = Vertex {
                 component: root,
                 entry: clock,
-                end: 0,
+                ..Vertex::default()
             };
             clock += 1;
             stack.push((vertex, incoming, true));
@@ -1762,6 +1788,7 @@ fn index_forest(
                 }
             }
         }
+        vertices[root].root_generation = root_generation(root);
     }
     Ok(ForwardingForest { vertices, children })
 }

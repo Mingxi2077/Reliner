@@ -34,7 +34,7 @@ fn small_and_exact_fit_pass_and_one_byte_over_has_egress_evidence() {
     let mut doc = lab();
     let result = report(&doc);
     assert_eq!(result["report_version"], 4);
-    assert_eq!(result["model_version"], 4);
+    assert_eq!(result["model_version"], 14);
     assert_eq!(result["settings"]["ipv4_dont_fragment"], true);
     assert_eq!(result["trace"]["status"], "disabled");
     assert_eq!(result["probes"][0]["outcome"]["at_ns"], "1600");

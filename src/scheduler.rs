@@ -529,6 +529,11 @@ fn compile(shared: &Shared, id: RunId, input: String) {
     state.compiling -= 1;
     let job = state.job_mut(id);
     match result {
+        Ok(simulation) if simulation.next_work().is_none() => {
+            drop(state);
+            finish_run(shared, id, simulation);
+            return;
+        }
         Ok(simulation) => {
             job.simulation = Some(simulation);
             if job.intent == Intent::Pause {

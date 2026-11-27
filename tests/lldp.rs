@@ -12,25 +12,52 @@ fn expected() -> LldpExpectation {
 }
 
 const START: u32 = 1_700_000_000;
+const ETH1_FCS: [u8; 4] = [0x2e, 0x97, 0xa5, 0x39];
+
+fn pcap_with_fcs(little: bool, words: u32, records: &[(u32, u32, Vec<u8>)]) -> Vec<u8> {
+    let mut bytes = pcap(little, false, records);
+    let link = 1 | (1 << 26) | (words << 28);
+    bytes[20..24].copy_from_slice(&if little {
+        link.to_le_bytes()
+    } else {
+        link.to_be_bytes()
+    });
+    bytes
+}
 
 #[test]
 fn ethernet_pcap_fcs_metadata_does_not_change_the_neighbor() {
-    for (little, words) in [(true, 0u32), (false, 2u32)] {
+    for (little, words) in [(true, 0), (true, 2), (false, 2)] {
         let mut payload = frame(b'1', 120);
         if words == 2 {
-            payload.extend([0x2e, 0x97, 0xa5, 0x39]);
+            payload.extend(ETH1_FCS);
         }
-        let mut bytes = pcap(little, false, &[(START, 0, payload)]);
-        let link = 1 | (1 << 26) | (words << 28);
-        bytes[20..24].copy_from_slice(&if little {
-            link.to_le_bytes()
-        } else {
-            link.to_be_bytes()
-        });
+        let bytes = pcap_with_fcs(little, words, &[(START, 0, payload)]);
         assert_eq!(
             check_lldp_pcap(&bytes, &expected()).unwrap().status,
             LldpStatus::Match
         );
+    }
+}
+
+#[test]
+fn bad_fcs_prevents_a_verdict_even_alongside_a_valid_neighbor() {
+    let mut good = frame(b'1', 120);
+    good.extend(ETH1_FCS);
+    let mut damaged = good.clone();
+    damaged[29] = b'2';
+    for records in [
+        vec![(START, 0, damaged.clone())],
+        vec![(START, 0, good.clone()), (START, 1, damaged.clone())],
+        vec![(START, 0, damaged), (START, 1, good)],
+    ] {
+        for little in [true, false] {
+            let bytes = pcap_with_fcs(little, 2, &records);
+            assert_eq!(
+                check_lldp_pcap(&bytes, &expected()).unwrap_err(),
+                LldpError::MalformedData
+            );
+        }
     }
 }
 
@@ -82,6 +109,60 @@ fn frame(port: u8, ttl: u16) -> Vec<u8> {
     f.extend([0, 0]);
     f.resize(60, 0);
     f
+}
+
+fn snap_frame(port: u8, ttl: u16) -> Vec<u8> {
+    let mut f = frame(port, ttl);
+    // The length covers the eight-byte LLC/SNAP header and the 22-byte LLDPDU.
+    f.splice(12..14, [0, 30, 0xaa, 0xaa, 3, 0, 0, 0, 0x88, 0xcc]);
+    f.truncate(60);
+    f
+}
+
+#[test]
+fn ethernet_ii_and_snap_share_neighbor_identity_and_withdrawal() {
+    let mut records = vec![
+        (START, 0, frame(b'1', 120)),
+        (START, 1, snap_frame(b'2', 120)),
+    ];
+    let mixed = check(&records).unwrap();
+    assert_eq!(mixed.status, LldpStatus::Ambiguous);
+    assert_eq!(mixed.neighbors.len(), 2);
+
+    let mut withdrawal = snap_frame(b'1', 0);
+    withdrawal.splice(12..12, [0x81, 0, 0, 42]);
+    records.push((START, 2, withdrawal));
+    let one = check(&records).unwrap();
+    assert_eq!(one.status, LldpStatus::WrongPeer);
+    assert_eq!(one.neighbors[0].state, NeighborState::Withdrawn);
+    assert_eq!(one.neighbors[1].state, NeighborState::Active);
+}
+
+#[test]
+fn snap_is_bounded_by_the_802_3_length() {
+    let mut f = snap_frame(b'1', 120);
+    // A partial SNAP header, an End TLV split by padding, and an overlong declaration.
+    for length in [7u16, 29, 47] {
+        f[12..14].copy_from_slice(&length.to_be_bytes());
+        assert_eq!(
+            check(&[(START, 0, f.clone())]).unwrap_err(),
+            LldpError::MalformedData
+        );
+    }
+    for (field, status) in [
+        (1500u16, LldpStatus::Match),
+        (1501, LldpStatus::MissingEvidence),
+    ] {
+        f.resize(14 + usize::from(field), 0);
+        f[12..14].copy_from_slice(&field.to_be_bytes());
+        assert_eq!(check(&[(START, 0, f.clone())]).unwrap().status, status);
+    }
+    let mut f = snap_frame(b'1', 120);
+    f[19] = 1; // Same PID under another organization's OUI.
+    assert_eq!(
+        check(&[(START, 0, f)]).unwrap().status,
+        LldpStatus::MissingEvidence
+    );
 }
 
 fn pcap(little: bool, nano: bool, records: &[(u32, u32, Vec<u8>)]) -> Vec<u8> {

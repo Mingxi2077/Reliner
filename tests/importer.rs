@@ -124,10 +124,26 @@ fn unknown_network_configuration_is_preserved_and_prevents_a_confirmed_result() 
 }
 
 #[test]
+fn empty_node_declarations_keep_inherited_settings_and_links() {
+    let yaml = "name: lab\ntopology:\n  defaults: {kind: linux, image: alpine}\n  nodes:\n    a:\n    b:\n  links:\n    - endpoints: [a:eth1, b:eth1]\n";
+    let explicit = yaml.replace("a:\n", "a: {}\n").replace("b:\n", "b: {}\n");
+    let preview = preview_containerlab(yaml).unwrap();
+    assert_eq!(preview, preview_containerlab(&explicit).unwrap());
+    assert_eq!(preview.links.len(), 1);
+    assert_eq!(preview.source.gaps[0].source_path, "/topology/defaults");
+    for value in ["false", "[]", "'linux'"] {
+        assert!(matches!(
+            preview_containerlab(&yaml.replace("    a:\n", &format!("    a: {value}\n"))),
+            Err(ImportError::Source { path, .. }) if path == "/topology/nodes/a"
+        ));
+    }
+}
+
+#[test]
 fn brief_and_expanded_veth_have_the_same_ids_after_reordering() {
     let mut input = source();
     let first = imported(SOURCE, &options());
-    input["topology"]["links"][0] = json!({"type": "veth", "endpoints": [
+    input["topology"]["links"][0] = json!({"type": " \tVeTh ", "endpoints": [
         {"node": "r1", "interface": "eth1"}, {"node": "pc-a", "interface": "eth1"}
     ]});
     input["topology"]["links"].as_array_mut().unwrap().reverse();
@@ -717,7 +733,7 @@ fn import_maps_native_vlan_without_certifying_the_source_device_behavior() {
     assert_eq!(native.value, 10);
     assert_eq!(native.source, reliner::SettingSource::Explicit);
     let report = serde_json::to_value(run_lab(&input).unwrap()).unwrap();
-    assert_eq!(report["model_version"], 12);
+    assert_eq!(report["model_version"], 14);
     assert!(
         report["probes"]
             .as_array()

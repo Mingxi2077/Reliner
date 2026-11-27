@@ -21,9 +21,10 @@ import time
 
 
 def read_command(argv, *, structured=True):
-    result = subprocess.run(argv, check=True, stdout=subprocess.PIPE,
-                            text=True, timeout=15)
-    return {"argv": argv, "exit_code": result.returncode,
+    result = subprocess.run(argv, capture_output=True, text=True, timeout=15)
+    sys.stderr.write(result.stderr)
+    result.check_returncode()
+    return {"argv": argv, "exit_code": result.returncode, "stderr": result.stderr,
             "stdout": json.loads(result.stdout) if structured else result.stdout}
 
 

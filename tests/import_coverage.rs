@@ -34,7 +34,7 @@ fn imported_return_policy_cannot_confirm_a_modeled_reply_or_pollute_another_comp
     let result = run_lab(&lab().to_string()).unwrap();
     let value = serde_json::to_value(&result).unwrap();
     assert_eq!(value["report_version"], 8);
-    assert_eq!(value["model_version"], 11);
+    assert_eq!(value["model_version"], 14);
     assert_eq!(value["probes"][0]["outcome"]["status"], "undetermined");
     assert_eq!(
         value["probes"][0]["outcome"]["modeled"]["status"],
@@ -87,7 +87,7 @@ fn filling_the_last_import_gap_preserves_the_new_model_contract() {
     doc["import_source"]["gaps"] = json!([]);
     let result = serde_json::to_value(run_lab(&doc.to_string()).unwrap()).unwrap();
     assert_eq!(result["report_version"], 8);
-    assert_eq!(result["model_version"], 11);
+    assert_eq!(result["model_version"], 14);
     assert_eq!(result["probes"][0]["outcome"]["status"], "reachable");
 }
 

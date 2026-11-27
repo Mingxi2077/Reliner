@@ -387,10 +387,15 @@ pub fn preview_containerlab(input: &str) -> Result<ImportPreview, ImportError> {
         }
     }
     let mut nodes = BTreeMap::new();
+    let empty_node = Map::new();
     for (id, value) in node_values {
         let path = child("/topology/nodes", id);
         identifier(id, &path)?;
-        let object = source_object(value, &path)?;
+        let object = if value.is_null() {
+            &empty_node
+        } else {
+            source_object(value, &path)?
+        };
         let kind = object
             .get("kind")
             .map(|value| source_string(value, &child(&path, "kind")).map(str::to_owned))
@@ -493,7 +498,8 @@ pub fn preview_containerlab(input: &str) -> Result<ImportPreview, ImportError> {
                 ));
             }
             let brief = matches!(kind, None | Some("brief"));
-            let supported = brief || kind == Some("veth");
+            let supported =
+                brief || kind.is_some_and(|name| name.trim().eq_ignore_ascii_case("veth"));
             if !supported {
                 gap(
                     &mut source,

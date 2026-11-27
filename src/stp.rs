@@ -11,20 +11,43 @@ use crate::{InputError, StpBridgeState, StpHistory, StpLinkState, StpPortRole, S
 pub(crate) struct StpPlan {
     pub(crate) convergence_ns: u64,
     pub(crate) work: usize,
+    pub(crate) domains: Vec<StpDomain>,
+    by_link: HashMap<LinkIndex, StpSlot>,
+    pub(crate) forest_domain: Vec<Option<usize>>,
+    bridge_order: Vec<StpSlot>,
+    link_order: Vec<StpSlot>,
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct StpSlot {
+    pub(crate) domain: usize,
+    pub(crate) local: usize,
+}
+
+pub(crate) struct StpDomain {
+    pub(crate) work: usize,
     pub(crate) forest: StpForestPlan,
     heap_capacity: usize,
     bridges: Vec<Bridge>,
     links: Vec<InterSwitchLink>,
-    by_link: HashMap<LinkIndex, usize>,
+}
+
+#[derive(Default)]
+struct DomainBuilder {
+    bridges: Vec<Bridge>,
+    links: Vec<InterSwitchLink>,
+    edges: Vec<(LinkIndex, [PortIndex; 2])>,
 }
 
 struct Bridge {
+    row: usize,
     device: DeviceIndex,
     priority: u16,
     links: Vec<(usize, usize)>,
 }
 
 struct InterSwitchLink {
+    row: usize,
     link: LinkIndex,
     ends: [Endpoint; 2],
 }
@@ -96,12 +119,13 @@ impl StpPlan {
         }
         switches.sort_unstable_by_key(|&(index, priority)| (priority, devices[index].id.as_str()));
         let mut rank = HashMap::new();
-        let mut bridges: Vec<_> = switches
+        let bridges: Vec<_> = switches
             .into_iter()
             .enumerate()
             .map(|(index, (device, priority))| {
                 rank.insert(device, index);
                 Bridge {
+                    row: index,
                     device,
                     priority,
                     links: Vec::new(),
@@ -125,6 +149,7 @@ impl StpPlan {
                 cost: costs.remove(&ports[port].id).unwrap_or(1),
             };
             managed.push(InterSwitchLink {
+                row: 0,
                 link: index,
                 ends: [endpoint(left, a), endpoint(right, b)],
             });
@@ -137,58 +162,168 @@ impl StpPlan {
             );
         }
         managed.sort_unstable_by(|a, b| links[a.link].id.cmp(&links[b.link].id));
-        let mut by_link = HashMap::new();
-        for (slot, link) in managed.iter().enumerate() {
-            by_link.insert(link.link, slot);
-            for (side, end) in link.ends.iter().enumerate() {
-                bridges[end.bridge].links.push((slot, side));
-            }
-        }
-        for bridge in &mut bridges {
-            // For the same peer, the first up edge has the best receive cost and port tie-breaks.
-            bridge.links.sort_unstable_by_key(|&(slot, side)| {
-                let [from, to] = [managed[slot].ends[side], managed[slot].ends[1 - side]];
-                (to.bridge, to.cost, from.port, to.port)
-            });
-        }
-        let forest = StpForestPlan::compile(devices.len(), ports, links, |link| {
-            by_link.get(&link).copied()
-        });
-        let (heap_work, heap_capacity) = heap_bounds(&bridges, &managed);
-        // Count bridge preparation and evidence, both adjacency scans, link roles,
-        // and the two endpoint updates that a changed forwarding link can trigger.
-        let work = forest.work() + heap_work + 5 * bridges.len() + 7 * managed.len();
-        Ok(Some(Self {
+        Ok(Some(Self::partition(
             convergence_ns,
-            work,
-            forest,
-            heap_capacity,
             bridges,
-            links: managed,
-            by_link,
-        }))
+            managed,
+            devices.len(),
+            ports,
+            links,
+        )))
     }
 
-    pub(crate) fn slot(&self, link: LinkIndex) -> Option<usize> {
+    fn partition(
+        convergence_ns: u64,
+        bridges: Vec<Bridge>,
+        managed: Vec<InterSwitchLink>,
+        device_count: usize,
+        ports: &[Port],
+        links: &[Link],
+    ) -> Self {
+        // Physical switch connectivity fixes the clock domain even while links are down.
+        let mut adjacent = vec![Vec::new(); bridges.len()];
+        for link in &managed {
+            let [a, b] = link.ends.map(|end| end.bridge);
+            adjacent[a].push(b);
+            adjacent[b].push(a);
+        }
+        let mut membership = vec![None; bridges.len()];
+        let mut count = 0;
+        let mut stack = Vec::new();
+        for root in 0..bridges.len() {
+            if membership[root].is_some() {
+                continue;
+            }
+            membership[root] = Some(count);
+            stack.push(root);
+            while let Some(bridge) = stack.pop() {
+                for &peer in &adjacent[bridge] {
+                    if membership[peer].is_none() {
+                        membership[peer] = Some(count);
+                        stack.push(peer);
+                    }
+                }
+            }
+            count += 1;
+        }
+        let mut groups: Vec<_> = (0..count).map(|_| DomainBuilder::default()).collect();
+        let mut bridge_order = Vec::with_capacity(bridges.len());
+        let mut link_order = Vec::with_capacity(managed.len());
+        let mut switch_domain = vec![None; device_count];
+        for bridge in bridges {
+            let domain = membership[bridge.row].unwrap();
+            bridge_order.push(StpSlot {
+                domain,
+                local: groups[domain].bridges.len(),
+            });
+            groups[domain].bridges.push(bridge);
+        }
+        let mut by_link = HashMap::new();
+        for (row, mut link) in managed.into_iter().enumerate() {
+            link.row = row;
+            let domain = bridge_order[link.ends[0].bridge].domain;
+            let group = &mut groups[domain];
+            let slot = StpSlot {
+                domain,
+                local: group.links.len(),
+            };
+            for (side, end) in link.ends.iter_mut().enumerate() {
+                end.bridge = bridge_order[end.bridge].local;
+                let bridge = &mut group.bridges[end.bridge];
+                switch_domain[bridge.device] = Some(domain);
+                bridge.links.push((slot.local, side));
+            }
+            by_link.insert(link.link, slot);
+            link_order.push(slot);
+            group.links.push(link);
+        }
+        let mut forest_domain = vec![None; ports.len()];
+        for (index, link) in links.iter().enumerate() {
+            if let Some(domain) = link
+                .ports
+                .iter()
+                .find_map(|&p| switch_domain[ports[p].device])
+            {
+                for p in link.ports {
+                    forest_domain[p] = Some(domain);
+                }
+                groups[domain].edges.push((index, link.ports));
+            }
+        }
+        let mut domains = Vec::with_capacity(count);
+        for DomainBuilder {
+            mut bridges,
+            links: managed,
+            edges,
+        } in groups
+        {
+            for bridge in &mut bridges {
+                // The first up edge to a peer wins the receive cost and port tie-breaks.
+                bridge.links.sort_unstable_by_key(|&(slot, side)| {
+                    let [from, to] = [managed[slot].ends[side], managed[slot].ends[1 - side]];
+                    (to.bridge, to.cost, from.port, to.port)
+                });
+            }
+            let forest =
+                StpForestPlan::compile(ports, &edges, |link| by_link.get(&link).map(|s| s.local));
+            let (heap_work, heap_capacity) = heap_bounds(&bridges, &managed);
+            let managed_bridges = if managed.is_empty() { 0 } else { bridges.len() };
+            let work =
+                forest.work() + heap_work + 5 * bridges.len() + 9 * managed.len() + managed_bridges;
+            domains.push(StpDomain {
+                work,
+                forest,
+                heap_capacity,
+                bridges,
+                links: managed,
+            });
+        }
+        // The first publication merges domains and restores the original report slot order.
+        let merge_work = if count > 1 {
+            3 * (bridge_order.len() + link_order.len())
+        } else {
+            0
+        };
+        let work = domains.iter().map(|domain| domain.work).sum::<usize>() + merge_work;
+        Self {
+            convergence_ns,
+            domains,
+            work,
+            bridge_order,
+            link_order,
+            by_link,
+            forest_domain,
+        }
+    }
+
+    pub(crate) fn slot(&self, link: LinkIndex) -> Option<StpSlot> {
         self.by_link.get(&link).copied()
     }
 
+    pub(crate) fn initial_rows(&self) -> (usize, usize) {
+        (self.bridge_order.len(), self.link_order.len())
+    }
+
     pub(crate) fn bridge_settings(&self) -> impl Iterator<Item = (DeviceIndex, u16)> + '_ {
-        self.bridges
-            .iter()
-            .map(|bridge| (bridge.device, bridge.priority))
+        self.bridge_order.iter().map(|slot| {
+            let bridge = &self.domains[slot.domain].bridges[slot.local];
+            (bridge.device, bridge.priority)
+        })
     }
 
     pub(crate) fn port_settings(&self) -> impl Iterator<Item = (PortIndex, u32)> + '_ {
-        self.links
-            .iter()
-            .flat_map(|link| link.ends.map(|end| (end.port, end.cost)))
+        self.link_order.iter().flat_map(|slot| {
+            self.domains[slot.domain].links[slot.local]
+                .ends
+                .map(|end| (end.port, end.cost))
+        })
     }
+}
 
+impl StpDomain {
     pub(crate) fn link_count(&self) -> usize {
         self.links.len()
     }
-
     pub(crate) fn link_at(&self, slot: usize) -> LinkIndex {
         self.links[slot].link
     }
@@ -250,15 +385,18 @@ impl StpPlan {
         for (bridge, path) in best.iter().enumerate() {
             let root_bridge_id = bridge_id(path.root);
             let root_port_id = path.root_port.map(|port| topology.ports[port].id.as_str());
-            if history.current_bridge(bridge).is_some_and(|row| {
-                row.root_path_cost == path.cost
-                    && row.root_bridge_id == root_bridge_id
-                    && row.root_port_id.as_deref() == root_port_id
-            }) {
+            if history
+                .current_bridge(self.bridges[bridge].row)
+                .is_some_and(|row| {
+                    row.root_path_cost == path.cost
+                        && row.root_bridge_id == root_bridge_id
+                        && row.root_port_id.as_deref() == root_port_id
+                })
+            {
                 continue;
             }
             bridges.push((
-                bridge,
+                self.bridges[bridge].row,
                 StpBridgeState {
                     bridge_id: bridge_id(bridge).into(),
                     priority: self.bridges[bridge].priority,
@@ -270,7 +408,7 @@ impl StpPlan {
         }
         let mut active = Vec::with_capacity(self.links.len());
         let mut links = Vec::with_capacity(self.links.len());
-        for (slot, link) in self.links.iter().enumerate() {
+        for link in &self.links {
             let mut roles = [StpPortRole::Disabled; 2];
             if up(link.link) {
                 let [a, b] = link
@@ -287,13 +425,13 @@ impl StpPlan {
             }
             active.push(roles.contains(&StpPortRole::Root));
             if history
-                .current_link(slot)
+                .current_link(link.row)
                 .is_some_and(|row| row.ports[0].role == roles[0] && row.ports[1].role == roles[1])
             {
                 continue;
             }
             links.push((
-                slot,
+                link.row,
                 StpLinkState {
                     link_id: topology.links[link.link].id.clone(),
                     ports: std::array::from_fn(|side| {
@@ -316,37 +454,26 @@ impl StpPlan {
 }
 
 fn heap_bounds(bridges: &[Bridge], links: &[InterSwitchLink]) -> (usize, usize) {
-    let mut visited = vec![false; bridges.len()];
-    let mut pending = Vec::new();
-    let mut work = 0;
-    let mut capacity = 1;
-    for root in 0..bridges.len() {
-        if visited[root] {
-            continue;
-        }
-        visited[root] = true;
-        pending.push(root);
-        let mut directions: usize = 0;
-        while let Some(bridge) = pending.pop() {
-            let mut previous_peer = None;
-            for &(slot, side) in &bridges[bridge].links {
-                let peer = links[slot].ends[1 - side].bridge;
-                if previous_peer == Some(peer) {
-                    continue;
-                }
-                previous_peer = Some(peer);
-                directions += 1;
-                if !visited[peer] {
-                    visited[peer] = true;
-                    pending.push(peer);
-                }
+    // Positive costs settle each bridge once. Parallel links relax each neighbor only once.
+    // As in routing SPF, a connected settled set has consumed at least |S|-1 internal
+    // pairs. The remaining incident pairs bound all heap entries, including stale ones.
+    let mut directions = 0;
+    let mut excess = 0;
+    for bridge in bridges {
+        let mut last = None;
+        let mut degree: usize = 0;
+        for &(slot, side) in &bridge.links {
+            let peer = links[slot].ends[1 - side].bridge;
+            if last != Some(peer) {
+                degree += 1;
+                last = Some(peer);
             }
         }
-        let pairs = directions / 2;
-        capacity = capacity.max(pairs);
-        // One component root uses a depth-one heap. Deleting a distinct peer pair
-        // can buy at most one extra root; that pair cannot also relax a path.
-        work += 2 + 2 * pairs * (1 + pairs.max(1).ilog2() as usize);
+        directions += degree;
+        excess += degree.saturating_sub(2);
     }
-    (work, capacity)
+    let pairs = directions / 2;
+    let capacity = pairs.clamp(1, 2 + excess);
+    // Splitting a physical component buys at most one extra root per missing pair.
+    (2 + 2 * pairs * (1 + capacity.ilog2() as usize), capacity)
 }

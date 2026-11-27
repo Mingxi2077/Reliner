@@ -41,7 +41,7 @@ fn publishes_the_return_prefix_and_keeps_failure_and_recovery_timing() {
     let mut doc = lab();
     let broken = report(&doc);
     assert_eq!(broken["report_version"], 6);
-    assert_eq!(broken["model_version"], 10);
+    assert_eq!(broken["model_version"], 14);
     assert_eq!(
         cause(&broken, 0)["fact"]["reason"],
         "awaiting_initial_convergence"

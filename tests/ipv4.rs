@@ -26,6 +26,86 @@ fn outage(document: &mut Value, down: &str, up: &str) {
 }
 
 #[test]
+fn missing_source_gateway_rejects_before_arp_and_closes_at_the_deadline() {
+    let mut doc = lab();
+    doc["devices"][0].as_object_mut().unwrap().remove("gateway");
+    doc["scenario"]["probes"]
+        .as_array_mut()
+        .unwrap()
+        .truncate(1);
+    doc["scenario"]["warmup"] = json!([]);
+    doc["scenario"]["trace_limit"] = json!(16);
+    let run = run_lab(&doc.to_string()).unwrap();
+    let result = serde_json::to_value(&run).unwrap();
+    let probe = &result["probes"][0];
+    let outcome = &probe["outcome"];
+    assert_eq!(outcome["waiting_for"], "probe_deadline");
+    assert_eq!(outcome["at_ns"], "1800");
+    let cause = fact(&result, &outcome["cause"]);
+    assert_eq!(cause["fact"]["kind"], "ipv4_route_miss");
+    assert_eq!(cause["at_ns"], "1000");
+    assert_eq!(cause["port"]["port_id"], "a-eth0");
+    let events: Vec<_> = result["trace"]["entries"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|entry| entry["event"].as_str().unwrap())
+        .collect();
+    assert_eq!(events, ["probe_start", "probe_deadline"]);
+    let counts = run.probe_counts();
+    assert_eq!(counts.rejected_before_send, 1);
+    assert_eq!(counts.timed_out, 0);
+    assert_eq!(result["model_version"], 14);
+    assert_eq!(report(&lab())["model_version"], 14);
+}
+
+#[test]
+fn immediate_link_drop_points_back_to_the_incoming_echo() {
+    for (cold, kind) in [(false, "echo_request"), (true, "arp_request")] {
+        let mut doc = lab();
+        doc["scenario"]["link_actions"] = json!([{"link":"r1-r2","at_ns":"1050","state":"down"}]);
+        if cold {
+            doc["scenario"]["warmup"].as_array_mut().unwrap().remove(1);
+        }
+        let untraced = report(&doc);
+        doc["scenario"]["trace_limit"] = json!(128);
+        let result = report(&doc);
+        let cause = fact(&result, &result["probes"][0]["outcome"]["cause"]);
+        let parent = result["trace"]["entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|e| e["at_ns"] == "1100" && e["port"]["port_id"] == "r1-lan")
+            .unwrap();
+        assert_eq!(parent["frame"]["kind"], "echo_request");
+        assert_eq!(cause["fact"]["kind"], "link_down");
+        assert_eq!(cause["frame"]["kind"], kind);
+        assert_eq!(cause["frame"]["parent_id"], parent["frame"]["id"]);
+        assert_ne!(cause["frame"]["id"], parent["frame"]["id"]);
+        assert_eq!(untraced["evidence"], result["evidence"]);
+        assert_eq!(result["model_version"], 14);
+    }
+}
+
+#[test]
+fn missing_return_gateway_keeps_request_evidence_and_waits_for_echo() {
+    let mut doc = lab();
+    doc["devices"][3].as_object_mut().unwrap().remove("gateway");
+    let result = report(&doc);
+    let probe = &result["probes"][0];
+    let request = fact(&result, &probe["request_evidence_id"]);
+    let loss = fact(&result, &probe["outcome"]["cause"]);
+    assert_eq!(probe["outcome"]["waiting_for"], "echo_reply");
+    assert_eq!(loss["fact"]["kind"], "ipv4_route_miss");
+    assert_eq!(loss["fact"]["request_evidence_id"], request["id"]);
+    assert_ne!(loss["id"], request["id"]);
+    assert_eq!(loss["frame"]["kind"], "echo_reply");
+    assert_eq!(loss["frame"]["parent_id"], request["frame"]["id"]);
+    assert_ne!(loss["frame"]["id"], request["frame"]["id"]);
+    assert_eq!(result["model_version"], 14);
+}
+
+#[test]
 fn cold_static_ipv4_uses_interface_neighbors_and_independent_return_lookup() {
     let mut doc = lab();
     doc["scenario"]["warmup"] = json!([]);

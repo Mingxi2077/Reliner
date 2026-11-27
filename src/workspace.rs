@@ -15,6 +15,9 @@ use std::{
 use serde::{Deserialize, Serialize};
 use serde_json::value::RawValue;
 
+mod save;
+use save::{ExpectedFile, FileBaseline};
+
 const PRESENTATION_FIELD_BYTES: usize = ",\"presentation\":".len();
 
 use crate::{
@@ -141,6 +144,7 @@ pub enum WorkspaceError {
     InvalidDocument(String),
     InvalidCoverageReference,
     PathInUse(PathBuf),
+    SaveConflict(PathBuf),
     QueueFull,
     InputBudget,
     UnknownRun(RunId),
@@ -172,6 +176,9 @@ impl fmt::Display for WorkspaceError {
             Self::InvalidDocument(message) => out.write_str(message),
             Self::InvalidCoverageReference => out.write_str("缺项引用指向不存在的覆盖组件。"),
             Self::PathInUse(path) => write!(out, "{} 已由另一个打开的文档占用。", path.display()),
+            Self::SaveConflict(path) => {
+                write!(out, "{} 的磁盘内容已改变或正在保存。", path.display())
+            }
             Self::QueueFull => out.write_str("实验待办已满。"),
             Self::InputBudget => out.write_str("实验输入快照空间已满。"),
             Self::UnknownRun(id) => write!(out, "运行 {} 不在当前工作区的保留范围。", id.0),
@@ -251,6 +258,16 @@ fn provided_raw<'de, D: serde::Deserializer<'de>>(
 }
 
 impl<'a> NativeDocument<'a> {
+    fn split_layout(&mut self) -> Result<Option<(String, Arc<str>)>, WorkspaceError> {
+        let Some(layout) = self.presentation.take() else {
+            return Ok(None);
+        };
+        Ok(Some((
+            serde_json::to_string(self)?,
+            presentation_value(layout.get())?,
+        )))
+    }
+
     fn read(input: &'a str) -> Result<Self, WorkspaceError> {
         let input = input.strip_prefix('\u{feff}').unwrap_or(input);
         let doc: Self = serde_json::from_str(input)?;
@@ -282,8 +299,14 @@ impl<'a> NativeDocument<'a> {
     }
 }
 
+struct SavedFile {
+    selected_path: PathBuf,
+    baseline: FileBaseline,
+}
+
 struct Draft {
     info: DocumentInfo,
+    saved_file: Option<SavedFile>,
     experiment: Arc<str>,
     presentation: Option<Arc<str>>,
 }
@@ -339,12 +362,13 @@ impl Documents {
         path: &Path,
         except: Option<DocumentId>,
     ) -> Result<(), WorkspaceError> {
-        if self
-            .entries
-            .values()
-            .any(|doc| Some(doc.info.id) != except && doc.info.path.as_deref() == Some(path))
-        {
-            return Err(WorkspaceError::PathInUse(path.to_owned()));
+        for doc in self.entries.values() {
+            if Some(doc.info.id) != except
+                && let Some(saved) = &doc.info.path
+                && save::same_path(saved, path)?
+            {
+                return Err(WorkspaceError::PathInUse(path.to_owned()));
+            }
         }
         Ok(())
     }
@@ -388,28 +412,51 @@ impl Workspace {
 
     pub fn open_file(&self, path: &Path) -> Result<DocumentInfo, WorkspaceError> {
         let _saving = self.save_gate.lock().unwrap();
-        let path = fs::canonicalize(path)?;
+        let selected_path = std::path::absolute(path)?;
+        let path = fs::canonicalize(&selected_path)?;
         self.documents.lock().unwrap().path_available(&path, None)?;
-        let mut input = String::new();
-        let file = File::open(&path)?;
-        file.take(
-            (self.config.bytes_per_document as u64)
-                .saturating_add(1 + PRESENTATION_FIELD_BYTES as u64),
-        )
-        .read_to_string(&mut input)?;
-        self.open(input, Some(path))
+        let input = self.read_file(&path)?;
+        let binding = SavedFile {
+            selected_path,
+            baseline: FileBaseline::of_bytes(input.as_bytes()),
+        };
+        self.open(input, Some((path, binding)))
     }
 
     pub fn preview_file(&self, path: &Path) -> Result<crate::NativePreview, WorkspaceError> {
-        let mut input = String::new();
-        File::open(path)?
-            .take(self.config.bytes_per_document as u64 + 1)
-            .read_to_string(&mut input)?;
-        self.check_size(input.len())?;
+        let input = self.read_file(path)?;
+        if input.len() > self.config.bytes_per_document {
+            // Only a native document with a split layout gets the extra wire bytes.
+            let layout = NativeDocument::read(&input)
+                .ok()
+                .and_then(|mut native| native.split_layout().ok().flatten());
+            self.check_size(layout.map_or(input.len(), |(experiment, layout)| {
+                experiment.len() + layout.len()
+            }))?;
+        }
         Ok(crate::preview_native(input))
     }
 
-    fn open(&self, input: String, path: Option<PathBuf>) -> Result<DocumentInfo, WorkspaceError> {
+    fn read_file(&self, path: &Path) -> Result<String, WorkspaceError> {
+        let limit = self
+            .config
+            .bytes_per_document
+            .saturating_add(PRESENTATION_FIELD_BYTES);
+        let mut bytes = Vec::new();
+        File::open(path)?
+            .take((limit as u64).saturating_add(1))
+            .read_to_end(&mut bytes)?;
+        if bytes.len() > limit {
+            return Err(WorkspaceError::DocumentTooLarge);
+        }
+        String::from_utf8(bytes).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e).into())
+    }
+
+    fn open(
+        &self,
+        input: String,
+        file: Option<(PathBuf, SavedFile)>,
+    ) -> Result<DocumentInfo, WorkspaceError> {
         if input.len()
             > self
                 .config
@@ -419,18 +466,13 @@ impl Workspace {
             return Err(WorkspaceError::DocumentTooLarge);
         }
         let mut native = NativeDocument::read(&input)?;
-        let presentation = native
-            .presentation
-            .take()
-            .map(|raw| presentation_value(raw.get()))
-            .transpose()?;
         let topology_id = native.id.to_string();
         let native_revision = native.revision.to_string();
         let format_version = native.format_version;
-        let experiment: Arc<str> = if presentation.is_some() {
-            serde_json::to_string(&native)?.into()
-        } else {
-            input.into()
+        let (path, saved_file) = file.unzip();
+        let (experiment, presentation): (Arc<str>, _) = match native.split_layout()? {
+            Some((experiment, layout)) => (experiment.into(), Some(layout)),
+            None => (input.into(), None),
         };
         let bytes = experiment.len() + presentation.as_ref().map_or(0, |layout| layout.len());
         self.check_size(bytes)?;
@@ -459,6 +501,7 @@ impl Workspace {
             info.id,
             Draft {
                 info: info.clone(),
+                saved_file,
                 experiment,
                 presentation,
             },
@@ -692,8 +735,9 @@ impl Workspace {
         revision: Option<Revision>,
         path: &Path,
     ) -> Result<Revision, WorkspaceError> {
+        let target = save_path(path)?;
         let _saving = self.save_gate.lock().unwrap();
-        Ok(self.save(id, revision, path)?.info.revision)
+        Ok(self.save(id, revision, target)?.info.revision)
     }
 
     pub fn save_and_rerun(
@@ -722,8 +766,9 @@ impl Workspace {
         path: &Path,
         mode: RunMode,
     ) -> Result<SaveAndRun, WorkspaceError> {
+        let target = save_path(path)?;
         let _saving = self.save_gate.lock().unwrap();
-        let snapshot = self.save(id, revision, path)?;
+        let snapshot = self.save(id, revision, target)?;
         let effective_revision = snapshot.info.effective_revision;
         let rerun = self
             .scheduler
@@ -739,25 +784,49 @@ impl Workspace {
         &self,
         id: DocumentId,
         revision: Option<Revision>,
-        path: &Path,
+        target: SaveTarget,
     ) -> Result<DocumentView, WorkspaceError> {
-        let path = save_path(path)?;
-        let snapshot = {
+        let SaveTarget {
+            selected_path,
+            path,
+            expected,
+        } = target;
+        let (snapshot, expected) = {
             let docs = self.documents.lock().unwrap();
             let doc = docs.get(id)?;
             if let Some(revision) = revision {
                 doc.verify(revision)?;
             }
             docs.path_available(&path, Some(id))?;
-            doc.view()
+            let expected = match (&doc.saved_file, &doc.info.path) {
+                (Some(file), Some(saved)) if save::same_path(saved, &path)? => {
+                    if matches!(expected, ExpectedFile::Absent) {
+                        return Err(WorkspaceError::SaveConflict(path));
+                    }
+                    ExpectedFile::Unchanged(file.baseline)
+                }
+                (Some(file), Some(saved))
+                    if save::same_path(&file.selected_path, &selected_path)?
+                        || save::same_path(saved, &selected_path)? =>
+                {
+                    // The same selected path now resolves to a different file.
+                    return Err(WorkspaceError::SaveConflict(selected_path));
+                }
+                _ => expected,
+            };
+            (doc.view(), expected)
         };
-        write_document(&path, &snapshot)?;
+        let baseline = write_document(&path, &snapshot, expected)?;
         let mut docs = self.documents.lock().unwrap();
         let doc = docs
             .entries
             .get_mut(&id)
             .expect("save gate holds document open");
         doc.info.path = Some(path);
+        doc.saved_file = Some(SavedFile {
+            selected_path,
+            baseline,
+        });
         doc.info.saved_revision = Some(snapshot.info.revision);
         doc.info.dirty = doc.info.revision != snapshot.info.revision;
         Ok(snapshot)
@@ -1143,29 +1212,57 @@ fn presentation_value(json: &str) -> Result<Arc<str>, WorkspaceError> {
     Ok(json.into())
 }
 
-fn save_path(path: &Path) -> Result<PathBuf, WorkspaceError> {
-    match fs::canonicalize(path) {
-        Ok(path) => Ok(path),
-        Err(error) if error.kind() == io::ErrorKind::NotFound => {
-            let name = path.file_name().ok_or(error)?;
-            let parent = path
-                .parent()
-                .filter(|parent| !parent.as_os_str().is_empty())
-                .unwrap_or_else(|| Path::new("."));
-            Ok(fs::canonicalize(parent)?.join(name))
-        }
-        Err(error) => Err(error.into()),
-    }
+struct SaveTarget {
+    selected_path: PathBuf,
+    path: PathBuf,
+    expected: ExpectedFile,
 }
 
-fn write_document(path: &Path, document: &DocumentView) -> Result<(), WorkspaceError> {
+fn save_path(path: &Path) -> Result<SaveTarget, WorkspaceError> {
+    let selected_path = std::path::absolute(path)?;
+    let (path, expected) = match fs::canonicalize(&selected_path) {
+        Ok(path) => (path, ExpectedFile::OverwriteExisting),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            let name = selected_path.file_name().ok_or(error)?;
+            let parent = selected_path
+                .parent()
+                .expect("absolute path with file name");
+            (fs::canonicalize(parent)?.join(name), ExpectedFile::Absent)
+        }
+        Err(error) => return Err(error.into()),
+    };
+    Ok(SaveTarget {
+        selected_path,
+        path,
+        expected,
+    })
+}
+
+fn write_document(
+    path: &Path,
+    document: &DocumentView,
+    expected: ExpectedFile,
+) -> Result<FileBaseline, WorkspaceError> {
     static NEXT_TEMP: AtomicU64 = AtomicU64::new(0);
-    let temporary = path.with_file_name(format!(
-        ".reliner-{}-{}.tmp",
-        std::process::id(),
-        NEXT_TEMP.fetch_add(1, Ordering::Relaxed)
-    ));
-    let file = File::create_new(&temporary)?;
+    let (temporary, file) = loop {
+        let name = format!(
+            ".reliner-{}-{}.tmp",
+            std::process::id(),
+            NEXT_TEMP.fetch_add(1, Ordering::Relaxed)
+        );
+        if path
+            .file_name()
+            .is_some_and(|target| target.eq_ignore_ascii_case(&name))
+        {
+            continue;
+        }
+        let temporary = path.with_file_name(name);
+        match save::create_staged(&temporary, expected) {
+            Ok(file) => break (temporary, file),
+            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(e.into()),
+        }
+    };
     let result = (|| {
         let mut writer = BufWriter::new(file);
         if let Some(layout) = &document.presentation {
@@ -1178,8 +1275,9 @@ fn write_document(path: &Path, document: &DocumentView) -> Result<(), WorkspaceE
         writer.flush()?;
         writer.get_ref().sync_all()?;
         drop(writer);
-        fs::rename(&temporary, path)?;
-        Ok(())
+        let baseline = FileBaseline::of_file(&File::open(&temporary)?)?;
+        save::replace(&temporary, path, expected)?;
+        Ok(baseline)
     })();
     if result.is_err() {
         let _ = fs::remove_file(&temporary);
@@ -1190,6 +1288,67 @@ fn write_document(path: &Path, document: &DocumentView) -> Result<(), WorkspaceE
 #[cfg(test)]
 mod read_tests {
     use super::*;
+
+    #[test]
+    fn first_save_as_keeps_the_absence_observed_by_each_transaction() {
+        let directory = std::env::current_dir()
+            .unwrap()
+            .join(format!("reliner-first-save-{}", std::process::id()));
+        fs::create_dir(&directory).unwrap();
+        let name = directory.join("Lab.json");
+        #[cfg(windows)]
+        let other_name = {
+            fs::write(&name, b"").unwrap();
+            let alias = directory.join("LAB.json");
+            let other = if alias.exists() { alias } else { name.clone() };
+            fs::remove_file(&name).unwrap();
+            other
+        };
+        #[cfg(not(windows))]
+        let other_name = name.clone();
+        let first = Workspace::new(WorkspaceConfig::default()).unwrap();
+        let second = Workspace::new(WorkspaceConfig::default()).unwrap();
+        let a = first
+            .open_document(include_str!("../examples/vlan-lab.json").into())
+            .unwrap();
+        let b = second
+            .open_document(include_str!("../examples/ipv4-lab.json").into())
+            .unwrap();
+        // Both calls have selected an absent name. Commit B after A has even released its lock.
+        let first_target = save_path(&name).unwrap();
+        let second_target = save_path(&other_name).unwrap();
+        first.save(a.id, Some(a.revision), first_target).unwrap();
+        let result = second.save(b.id, Some(b.revision), second_target);
+        let disk = fs::read_to_string(&name).unwrap();
+        let unchanged = second.document(b.id).unwrap().info;
+        // A fresh, explicit Save As may replace the now-existing destination.
+        let overwrite = second.save_document(b.id, &other_name);
+        let replaced = fs::read_to_string(&other_name).unwrap();
+        fs::remove_file(&name).unwrap();
+        if other_name.exists() {
+            fs::remove_file(&other_name).unwrap();
+        }
+        fs::remove_dir(&directory).unwrap();
+        assert!(matches!(result, Err(WorkspaceError::SaveConflict(_))));
+        assert_eq!(disk, include_str!("../examples/vlan-lab.json"));
+        assert_eq!(unchanged, b);
+        assert_eq!(overwrite.unwrap(), b.revision);
+        assert_eq!(replaced, include_str!("../examples/ipv4-lab.json"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unix_replacement_stage_is_private_before_writing() {
+        use std::os::unix::fs::PermissionsExt;
+        let path = std::env::current_dir()
+            .unwrap()
+            .join(format!("reliner-private-stage-{}", std::process::id()));
+        let file = save::create_staged(&path, ExpectedFile::OverwriteExisting).unwrap();
+        let mode = file.metadata().unwrap().permissions().mode();
+        drop(file);
+        fs::remove_file(path).unwrap();
+        assert_eq!(mode & 0o077, 0);
+    }
 
     fn finish(workspace: &Workspace, document: DocumentId) -> RunId {
         let run = workspace.submit_run(document, RunMode::Automatic).unwrap();

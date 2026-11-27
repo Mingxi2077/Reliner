@@ -157,7 +157,7 @@ struct TemporarySave(std::path::PathBuf);
 impl TemporarySave {
     fn new() -> Self {
         static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
-        Self(std::env::temp_dir().join(format!(
+        Self(std::env::current_dir().unwrap().join(format!(
             "reliner-save-test-{}-{}.json",
             std::process::id(),
             TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed)
@@ -169,6 +169,228 @@ impl Drop for TemporarySave {
     fn drop(&mut self) {
         let _ = fs::remove_file(&self.0);
     }
+}
+
+#[test]
+fn competing_workspaces_preserve_the_winner_and_can_save_the_other_draft_as() {
+    let file = TemporarySave::new();
+    fs::write(&file.0, VLAN).unwrap();
+    let workspaces = [workers(), workers()];
+    let docs = workspaces
+        .each_ref()
+        .map(|ws| ws.open_file(&file.0).unwrap());
+    let edits = [
+        workspaces[0]
+            .replace_experiment(docs[0].id, docs[0].revision, working_vlan())
+            .unwrap(),
+        workspaces[1]
+            .replace_presentation(docs[1].id, docs[1].revision, Some(r#"{"x":17}"#.into()))
+            .unwrap(),
+    ];
+    let start = std::sync::Barrier::new(2);
+    let save = |i: usize| {
+        start.wait();
+        workspaces[i].save_document_at(edits[i].id, edits[i].revision, &file.0)
+    };
+    let results = std::thread::scope(|scope| {
+        let first = scope.spawn(|| save(0));
+        let second = save(1);
+        [first.join().unwrap(), second]
+    });
+    assert_eq!(
+        results.iter().filter(|r| r.is_ok()).count(),
+        1,
+        "{results:?}"
+    );
+    let loser = results.iter().position(Result::is_err).unwrap();
+    assert!(matches!(
+        results[loser],
+        Err(WorkspaceError::SaveConflict(_))
+    ));
+    let winner = 1 - loser;
+    let ws = &workspaces[loser];
+    let edit = &edits[loser];
+    let bytes = fs::read(&file.0).unwrap();
+    let disk: Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(disk["revision"], if winner == 0 { "2" } else { "1" });
+    assert_eq!(
+        disk["presentation"]["x"],
+        if winner == 1 { json!(17) } else { Value::Null }
+    );
+    assert_eq!(ws.document(edit.id).unwrap().info, *edit);
+    assert!(matches!(
+        ws.save_and_rerun_at(edit.id, edit.revision, &file.0, RunMode::Automatic),
+        Err(WorkspaceError::SaveConflict(_))
+    ));
+    assert_eq!(ws.stats().compiles_started, 0);
+    let copy = TemporarySave::new();
+    fs::write(&copy.0, "existing Save As destination").unwrap();
+    ws.save_document(edit.id, &copy.0).unwrap();
+    ws.save_document(edit.id, &copy.0).unwrap();
+    assert_eq!(fs::read(&file.0).unwrap(), bytes);
+    // A same-length edit to the newly associated path must invalidate its saved baseline.
+    let mut external = fs::read(&copy.0).unwrap();
+    let column = external.iter().position(|&byte| byte == b'v').unwrap();
+    external[column] = b'w';
+    fs::write(&copy.0, &external).unwrap();
+    assert!(matches!(
+        ws.save_document(edit.id, &copy.0),
+        Err(WorkspaceError::SaveConflict(_))
+    ));
+    assert_eq!(fs::read(&copy.0).unwrap(), external);
+    fs::remove_file(&copy.0).unwrap();
+    assert!(matches!(
+        ws.save_document(edit.id, &copy.0),
+        Err(WorkspaceError::SaveConflict(_))
+    ));
+    assert!(!copy.0.exists());
+}
+
+#[test]
+#[cfg(windows)]
+fn case_only_rename_uses_the_original_content_baseline() {
+    let file = TemporarySave::new();
+    let renamed = TemporarySave(file.0.with_extension("JSON"));
+    fs::write(&file.0, VLAN).unwrap();
+    let ws = workers();
+    let doc = ws.open_file(&file.0).unwrap();
+    let edit = ws
+        .replace_presentation(doc.id, doc.revision, Some(r#"{"x":17}"#.into()))
+        .unwrap();
+    fs::rename(&file.0, &renamed.0).unwrap();
+    fs::write(&renamed.0, working_vlan()).unwrap();
+    assert!(matches!(
+        ws.save_document_at(doc.id, edit.revision, &renamed.0),
+        Err(WorkspaceError::SaveConflict(_))
+    ));
+    assert_eq!(fs::read_to_string(&renamed.0).unwrap(), working_vlan());
+    assert_eq!(ws.document(doc.id).unwrap().info, edit);
+    fs::write(&renamed.0, VLAN).unwrap();
+    assert_eq!(ws.save_document(doc.id, &renamed.0).unwrap(), edit.revision);
+}
+
+#[cfg(unix)]
+#[test]
+fn unix_save_preserves_private_modes_and_rejects_read_only_destinations() {
+    use std::os::unix::fs::PermissionsExt;
+    let file = TemporarySave::new();
+    fs::write(&file.0, VLAN).unwrap();
+    let ws = workers();
+    let doc = ws.open_file(&file.0).unwrap();
+    for mode in [0o600, 0o640] {
+        fs::set_permissions(&file.0, fs::Permissions::from_mode(mode)).unwrap();
+        ws.save_document(doc.id, &file.0).unwrap();
+        assert_eq!(
+            fs::metadata(&file.0).unwrap().permissions().mode() & 0o7777,
+            mode
+        );
+    }
+    fs::set_permissions(&file.0, fs::Permissions::from_mode(0o400)).unwrap();
+    let edit = ws
+        .replace_experiment(doc.id, doc.revision, working_vlan())
+        .unwrap();
+    let result = ws.save_and_rerun_at(doc.id, edit.revision, &file.0, RunMode::Automatic);
+    assert!(
+        matches!(result, Err(WorkspaceError::Io(ref e)) if e.kind() == std::io::ErrorKind::PermissionDenied)
+    );
+    assert_eq!(ws.document(doc.id).unwrap().info, edit);
+    assert_eq!(fs::read_to_string(&file.0).unwrap(), VLAN);
+    assert_eq!(
+        fs::metadata(&file.0).unwrap().permissions().mode() & 0o7777,
+        0o400
+    );
+
+    let other = workers();
+    let draft = other.open_document(IPV4.into()).unwrap();
+    assert!(matches!(other.save_document(draft.id, &file.0),
+        Err(WorkspaceError::Io(ref e)) if e.kind() == std::io::ErrorKind::PermissionDenied));
+    assert_eq!(fs::read_to_string(&file.0).unwrap(), VLAN);
+}
+
+#[test]
+fn redirected_open_path_cannot_overwrite_an_unrelated_file() {
+    let file = TemporarySave::new();
+    let unrelated = TemporarySave::new();
+    fs::write(&file.0, VLAN).unwrap();
+    fs::write(&unrelated.0, IPV4).unwrap();
+    let ws = workers();
+    let doc = ws.open_file(&file.0).unwrap();
+    fs::remove_file(&file.0).unwrap();
+    #[cfg(unix)]
+    std::os::unix::fs::symlink(&unrelated.0, &file.0).unwrap();
+    #[cfg(windows)]
+    if let Err(e) = std::os::windows::fs::symlink_file(&unrelated.0, &file.0) {
+        if e.raw_os_error() == Some(1314) {
+            eprintln!("file symlink creation requires Windows Developer Mode or privilege");
+            return;
+        }
+        panic!("{e}");
+    }
+    assert!(matches!(
+        ws.save_document(doc.id, &file.0),
+        Err(WorkspaceError::SaveConflict(_))
+    ));
+    assert_eq!(fs::read_to_string(&unrelated.0).unwrap(), IPV4);
+}
+
+#[test]
+fn preview_and_open_agree_at_the_saved_layout_byte_limit() {
+    let experiment = serde_json::from_str::<Value>(VLAN).unwrap().to_string();
+    let layout = r#"{"x":1}"#;
+    let workspace = Workspace::new(WorkspaceConfig {
+        bytes_per_document: experiment.len() + layout.len(),
+        ..WorkspaceConfig::default()
+    })
+    .unwrap();
+    let file = TemporarySave::new();
+    let doc = workspace.open_document(experiment).unwrap();
+    workspace
+        .replace_presentation(doc.id, doc.revision, Some(layout.into()))
+        .unwrap();
+    workspace.save_document(doc.id, &file.0).unwrap();
+    workspace.close_document(doc.id, false).unwrap();
+    let saved = fs::read_to_string(&file.0).unwrap();
+    assert_eq!(workspace.preview_file(&file.0).unwrap().text, saved);
+    let reopened = workspace.open_file(&file.0).unwrap();
+    workspace.close_document(reopened.id, false).unwrap();
+    fs::write(&file.0, saved.replace(layout, r#"{"x":10}"#)).unwrap();
+    assert!(matches!(
+        workspace.preview_file(&file.0),
+        Err(WorkspaceError::DocumentTooLarge)
+    ));
+    assert!(matches!(
+        workspace.open_file(&file.0),
+        Err(WorkspaceError::DocumentTooLarge)
+    ));
+}
+
+#[test]
+fn paused_initial_limit_releases_the_only_resident_slot() {
+    let mut config = WorkspaceConfig {
+        workers: 1,
+        resident_runs: 1,
+        ..WorkspaceConfig::default()
+    };
+    config.run_limits.pending_events = 1;
+    let ws = Workspace::new(config).unwrap();
+    let doc = ws.open_document(VLAN.into()).unwrap();
+    let first = ws.submit_run(doc.id, RunMode::Paused).unwrap();
+    let second = ws.submit_run(doc.id, RunMode::Automatic).unwrap();
+    let summary = wait(&ws, first, |s| s == RunStatus::Paused || s.is_terminal());
+    assert_eq!(summary.status, RunStatus::Incomplete);
+    assert_eq!(summary.stop_limit, Some(1));
+    assert_eq!(
+        summary.stop_reason,
+        Some(reliner::StopReason::ResourceLimit {
+            limit: reliner::ResourceLimit::PendingEvents
+        })
+    );
+    assert!(ws.run_report(first.id).unwrap().is_incomplete());
+    assert_eq!(
+        wait(&ws, second, RunStatus::is_terminal).status,
+        RunStatus::Incomplete
+    );
+    assert_eq!(ws.stats().resident, 0);
 }
 
 #[test]

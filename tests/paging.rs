@@ -1,13 +1,15 @@
 use std::time::{Duration, Instant};
 
-use reliner::{RunMode, RunStatus, Workspace, WorkspaceConfig};
+use reliner::{DocumentId, Outcome, RunMode, RunStatus, WaitingFor, Workspace, WorkspaceConfig};
 use serde_json::{Value, json};
 
 fn run(workspace: &Workspace, input: String) -> reliner::AcceptedRun {
     let document = workspace.open_document(input).unwrap();
-    let accepted = workspace
-        .submit_run(document.id, RunMode::Automatic)
-        .unwrap();
+    run_document(workspace, document.id)
+}
+
+fn run_document(workspace: &Workspace, id: DocumentId) -> reliner::AcceptedRun {
+    let accepted = workspace.submit_run(id, RunMode::Automatic).unwrap();
     let mut state = workspace.run_summary(accepted.id).unwrap();
     let deadline = Instant::now() + Duration::from_secs(10);
     while !state.status.is_terminal() {
@@ -93,6 +95,51 @@ fn comparison_pages_merge_ids_without_losing_added_or_removed_probes() {
             .entries
             .is_empty()
     );
+}
+
+#[test]
+fn restoring_source_gateway_preserves_compared_probe_parameters() {
+    let workspace = Workspace::new(WorkspaceConfig::default()).unwrap();
+    let mut input: Value = serde_json::from_str(include_str!("../examples/ipv4-lab.json")).unwrap();
+    let gateway = input["devices"][0]
+        .as_object_mut()
+        .unwrap()
+        .remove("gateway")
+        .unwrap();
+    let doc = workspace.open_document(input.to_string()).unwrap();
+    let before = run_document(&workspace, doc.id);
+
+    input["devices"][0]["gateway"] = gateway;
+    input["revision"] = json!("2");
+    let repaired = workspace
+        .replace_experiment(doc.id, doc.revision, input.to_string())
+        .unwrap();
+    let after = run_document(&workspace, repaired.id);
+
+    let page = workspace
+        .compare_run_page(before.id, after.id, 0, 2)
+        .unwrap();
+    assert_eq!(page.page.entries.len(), 2);
+    for row in &page.page.entries {
+        assert!(matches!(
+            row.baseline.as_ref().unwrap().outcome,
+            Outcome::Timeout {
+                waiting_for: WaitingFor::ProbeDeadline,
+                ..
+            }
+        ));
+        assert!(matches!(
+            row.candidate.as_ref().unwrap().outcome,
+            Outcome::Reachable { .. }
+        ));
+        assert!(
+            row.same_probe_parameters,
+            "gateway repair changed probe {} comparison (model {} -> {})",
+            row.probe_id, page.baseline.model_version, page.candidate.model_version
+        );
+    }
+    let full = workspace.compare_runs(before.id, after.id).unwrap();
+    assert_eq!(page.page.entries, full.probes);
 }
 
 #[test]

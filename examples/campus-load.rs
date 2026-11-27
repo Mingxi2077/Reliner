@@ -171,10 +171,12 @@ impl Workload {
             stp_round: 1
                 + 4 * (bridges + 2)
                 + 3 * (stp_links + 2)
-                + 5 * bridges
-                + 7 * stp_links
+                // Every bridge in this fixture joins the managed STP tree.
+                + 6 * bridges
+                + 9 * stp_links
                 + 2
-                + 2 * heap(3 + scale),
+                // Parallel trunks share a neighbor; the triangle and chain need at most three heap slots.
+                + 4 * (3 + scale),
             routing_event: 1
                 + 2 * routers
                 + 2 * routing_links
@@ -771,6 +773,22 @@ mod tests {
             let mut limits = WorkspaceConfig::default().run_limits;
             if scale == 256 {
                 limits.event_work = work.stp_round;
+                let one_short = run_lab_with_limits(
+                    &doc,
+                    RunLimits {
+                        event_work: work.stp_round - 1,
+                        ..limits
+                    },
+                )
+                .unwrap();
+                let stopped = scenario(&one_short);
+                assert_eq!(
+                    stopped.stop_reason,
+                    Some(reliner::StopReason::ResourceLimit {
+                        limit: reliner::ResourceLimit::EventWork,
+                    })
+                );
+                assert!(stopped.stp_events.is_empty());
             }
             let (end, _) = compare_workspace(&doc, limits, Some(&work)).unwrap();
             assert_eq!(end["probes"]["completed"], 7);
@@ -812,8 +830,8 @@ mod tests {
             ..WorkspaceConfig::default().run_limits
         };
         for (essential_facts, completed, at_ns, event_id) in [
-            (limits.essential_facts, 1059, "2129300", "18002"),
-            (7735, 3081, "6177200", "39824"),
+            (limits.essential_facts, 1059, "2129300", "18355"),
+            (7735, 3081, "6177200", "40851"),
         ] {
             let (end, _) = compare_workspace(
                 &input,

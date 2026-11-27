@@ -9,6 +9,71 @@ fn report(doc: &Value) -> Value {
     serde_json::to_value(run_lab(&doc.to_string()).unwrap()).unwrap()
 }
 
+#[test]
+fn unrelated_tree_change_preserves_learned_unicast_on_a_busy_access_link() {
+    let host = |id: &str, last: u8| {
+        json!({
+            "kind":"host","id":id,"name":id,"ipv4":format!("192.0.2.{last}"),"prefix_length":24,
+            "mac":format!("02:00:00:00:00:{last:02x}"),"port":{"id":format!("{id}0"),"name":"eth0"}
+        })
+    };
+    let switch = |id: &str, ports: &[&str]| {
+        json!({
+            "kind":"switch","id":id,"name":id,"ports":ports.iter().map(|p| json!({
+                "id":p,"name":p,"mode":{"kind":"access","vlan":10}
+            })).collect::<Vec<_>>()
+        })
+    };
+    let link = |id: &str, a: &str, b: &str| json!({"id":id,"ports":[a,b],"delay_ns":"10"});
+    let mut doc = json!({
+        "format_version":2,"id":"split","revision":"1",
+        "devices":[host("a",10),host("b",11),host("c",12),switch("s",&["sa","sb","sc"]),
+                   switch("x",&["xy"]),switch("y",&["yx"])],
+        "links":[link("a","a0","sa"),link("b","b0","sb"),link("c","c0","sc"),link("xy","xy","yx")],
+        "scenario":{"end_ns":"8000","stp_convergence_ns":"100","trace_limit":200,
+            "arp_lifetime_ns":"50000","mac_lifetime_ns":"50000","link_actions":[],
+            "warmup":[{"at_ns":"200","port":"a0","neighbor":"192.0.2.11"},
+                      {"at_ns":"2000","port":"a0","neighbor":"192.0.2.12"}],
+            "probes":[{"id":"b","source":"a","destination":"b","at_ns":"5000","deadline_ns":"7800"},
+                      {"id":"c","source":"a","destination":"c","at_ns":"5001","deadline_ns":"7800"}]}
+    });
+    doc["links"][2]["transmission"] = json!({"rate_bps":"1000000000","queue_frames":0});
+    let check_unicast = |doc: &Value| {
+        let result = report(doc);
+        for (probe, at) in result["probes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .zip(["5040", "6673"])
+        {
+            assert_eq!(probe["outcome"]["at_ns"], at);
+            assert_eq!(probe["outcome"]["status"], "reachable");
+        }
+        assert!(
+            !result["trace"]["entries"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|e| e["probe_id"] == "b" && e["port"]["port_id"] == "c0")
+        );
+    };
+    check_unicast(&doc);
+    doc["scenario"]["link_actions"] = json!([{"at_ns":"4000","link":"xy","state":"down"}]);
+    check_unicast(&doc);
+
+    // Repeat with the busy switch also participating in a managed tree.
+    doc["devices"][3] = switch("s", &["sa", "sb", "sc", "sz"]);
+    doc["devices"]
+        .as_array_mut()
+        .unwrap()
+        .push(switch("z", &["zs"]));
+    doc["links"]
+        .as_array_mut()
+        .unwrap()
+        .push(link("sz", "sz", "zs"));
+    check_unicast(&doc);
+}
+
 fn cause(result: &Value, index: usize) -> &Value {
     let probe = &result["probes"][index];
     assert_eq!(probe["outcome"]["status"], "timeout");
@@ -40,11 +105,108 @@ fn port<'a>(event: &'a Value, id: &str) -> &'a Value {
 }
 
 #[test]
+fn independent_domains_keep_their_convergence_clocks_and_recovery_gates() {
+    let mut doc = lab();
+    doc["scenario"]["stp_convergence_ns"] = json!("100");
+    doc["scenario"]["warmup"][0]["at_ns"] = json!("300");
+    doc["devices"][3]["ports"][0]["mode"]["allowed_vlans"] = json!([10, 20]);
+    for link in doc["links"].as_array_mut().unwrap() {
+        link["delay_ns"] = json!("5");
+    }
+    for (id, port) in [("x", "xy"), ("y", "yx")] {
+        doc["devices"].as_array_mut().unwrap().push(json!({
+            "kind":"switch","name":id,"id":id,"ports":[{"id":port,"name":port,"mode":{"kind":"access","vlan":10}}]
+        }));
+    }
+    doc["links"]
+        .as_array_mut()
+        .unwrap()
+        .push(json!({"id":"xy","ports":["xy","yx"],"delay_ns":"5"}));
+    doc["scenario"]["probes"] = json!([
+        {"id":"during","source":"pc-a","destination":"pc-b","at_ns":"760","deadline_ns":"850"},
+        {"id":"after","source":"pc-a","destination":"pc-b","at_ns":"800","deadline_ns":"950"}
+    ]);
+    let local_down = json!({"link":"s1-s3","at_ns":"700","state":"down"});
+    for recover in [false, true] {
+        let mut actions = vec![local_down.clone()];
+        if recover {
+            actions.push(json!({"link":"s1-s3","at_ns":"730","state":"up"}));
+        }
+        doc["scenario"]["link_actions"] = json!(actions);
+        let baseline = report(&doc);
+        actions.insert(0, json!({"link":"xy","at_ns":"650","state":"down"}));
+        doc["scenario"]["link_actions"] = json!(actions);
+        let changed = report(&doc);
+        let loss = cause(&changed, 0);
+        assert_eq!(
+            loss["fact"]["kind"],
+            if recover {
+                "stp_awaiting_convergence"
+            } else {
+                "link_down"
+            }
+        );
+        assert_eq!(loss["at_ns"], cause(&baseline, 0)["at_ns"]);
+        let events = changed["stp_events"].as_array().unwrap();
+        assert_eq!(
+            events.iter().map(|e| &e["at_ns"]).collect::<Vec<_>>(),
+            ["100", "750", "800"]
+        );
+        assert_eq!(port(&events[1], "s3-s1"), port(&events[0], "s3-s1"));
+        assert_eq!(port(&events[1], "xy")["role"], "disabled");
+        for i in 1..=2 {
+            assert_eq!(
+                events[i]["triggered_by_link_event_id"],
+                changed["link_events"][i - 1]["event_id"]
+            );
+        }
+        if recover {
+            assert_eq!(loss["stp_event_id"], events[0]["event_id"]);
+        }
+        assert_eq!(changed["probes"][1]["outcome"]["status"], "reachable");
+        assert_eq!(
+            changed["probes"][1]["outcome"]["at_ns"],
+            baseline["probes"][1]["outcome"]["at_ns"]
+        );
+    }
+
+    doc["scenario"]["link_actions"] = json!([
+        {"link":"xy","at_ns":"650","state":"down"},
+        {"link":"s1-s3","at_ns":"650","state":"down"}
+    ]);
+    let simultaneous = report(&doc);
+    let events = simultaneous["stp_events"].as_array().unwrap();
+    assert_eq!(events.len(), 3);
+    assert_eq!(events[1]["at_ns"], "750");
+    assert_eq!(events[2]["at_ns"], "750");
+    assert_ne!(events[1]["event_id"], events[2]["event_id"]);
+    assert_eq!(port(&events[1], "s3-s1")["role"], "root");
+    assert_eq!(port(&events[2], "s3-s1")["role"], "disabled");
+
+    // Initial history costs 18 facts, the two outages cost 2 and the X-Y update costs 5.
+    let limited = run_lab_with_limits(
+        &doc.to_string(),
+        RunLimits {
+            essential_facts: 25,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let limited = serde_json::to_value(limited).unwrap();
+    assert_eq!(
+        limited["stop_reason"],
+        json!({"resource_limit":{"limit":"essential_facts"}})
+    );
+    assert_eq!(limited["last_event_id"], events[1]["event_id"]);
+    assert_eq!(limited["stp_events"].as_array().unwrap(), &events[..2]);
+}
+
+#[test]
 fn path_cost_repair_explains_the_port_and_keeps_the_original_probes() {
     let mut doc = lab();
     let broken = report(&doc);
     assert_eq!(broken["report_version"], 7);
-    assert_eq!(broken["model_version"], 8);
+    assert_eq!(broken["model_version"], 14);
     let first = &broken["stp_events"][0];
     let alternate = &broken["stp_events"][1];
     let restored = &broken["stp_events"][2];
@@ -264,7 +426,7 @@ fn campus_stp_budget_covers_peer_pairs_and_the_compact_forwarding_index() {
         };
         report
     };
-    let below = run(85);
+    let below = run(94);
     assert_eq!(
         below.stop_reason,
         Some(reliner::StopReason::ResourceLimit {
@@ -274,7 +436,7 @@ fn campus_stp_budget_covers_peer_pairs_and_the_compact_forwarding_index() {
     assert_eq!(below.last_event_ns, 200);
     assert!(below.stp_events.is_empty());
 
-    let exact = run(86);
+    let exact = run(95);
     assert!(exact.stop_reason.is_none());
     let reference = run(RunLimits::default().event_work);
     assert_eq!(exact.probes, reference.probes);
@@ -364,7 +526,7 @@ fn stp_work_includes_possible_history_copies_before_the_commit() {
         };
         report
     };
-    let below = run(97);
+    let below = run(106);
     assert_eq!(
         below.stop_reason,
         Some(reliner::StopReason::ResourceLimit {
@@ -373,7 +535,7 @@ fn stp_work_includes_possible_history_copies_before_the_commit() {
     );
     assert_eq!(below.last_event_ns, 5400);
     assert_eq!(below.stp_events.len(), 5);
-    let exact = run(98);
+    let exact = run(107);
     assert!(exact.stop_reason.is_none());
     assert_eq!(exact.stp_events.len(), 6);
     assert_eq!(below.stp_events.get(4), exact.stp_events.get(4));

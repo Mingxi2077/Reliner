@@ -39,6 +39,9 @@ fn burst_drops_at_transit_egress_and_a_second_waiting_slot_repairs_it() {
     assert_eq!(drop["fact"]["link_id"], "r1-r2");
     assert_eq!(drop["fact"]["frame_bytes"], 102);
     assert_eq!(drop["fact"]["queue_frames"], 1);
+    assert_eq!(failed["model_version"], 14);
+    assert_eq!(drop["frame"]["parent_id"], drop["fact"]["event_id"]);
+    assert_ne!(drop["frame"]["id"], drop["frame"]["parent_id"]);
 
     doc["scenario"]["trace_limit"] = json!(1);
     let truncated = report(&doc);

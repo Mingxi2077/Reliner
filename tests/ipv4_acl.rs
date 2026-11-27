@@ -27,7 +27,7 @@ fn shadowed_host_exception_blocks_reply_and_reordering_repairs_the_same_probe() 
     let row = decision(&broken);
     let probe = &broken["probes"][0];
     assert_eq!(broken["report_version"], 9);
-    assert_eq!(broken["model_version"], 13);
+    assert_eq!(broken["model_version"], 14);
     assert_eq!(probe["outcome"]["status"], "timeout");
     assert_eq!(probe["outcome"]["cause"], row["id"]);
     assert!(probe["request_evidence_id"].is_string());

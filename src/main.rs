@@ -797,7 +797,16 @@ fn summarize_cause(mut output: impl Write, cause: Option<&Evidence>) -> io::Resu
             }
             Ok(())
         }
-        _ => unreachable!("a probe cause is a blocking fact"),
+        EvidenceFact::ArpResolved
+        | EvidenceFact::EchoRequestReceived
+        | EvidenceFact::EchoReplyReceived
+        | EvidenceFact::Ipv4AclDecision {
+            action: reliner::Ipv4AclAction::Permit,
+            ..
+        } => Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "超时原因引用的证据不是阻断事实。",
+        )),
     }
 }
 

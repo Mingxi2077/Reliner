@@ -181,19 +181,35 @@ fn mandatory<'a>(p: &mut &'a [u8], kind: u8) -> Result<&'a [u8], LldpError> {
 
 fn advertisement(mut p: &[u8]) -> Result<Option<(LldpId, LldpId, u16)>, LldpError> {
     let addresses = take(&mut p, 12).ok_or(LldpError::MalformedData)?;
-    loop {
-        match take(&mut p, 2).ok_or(LldpError::MalformedData)? {
-            [0x81, 0] | [0x88, 0xa8] => {
+    let type_or_length = loop {
+        let field = take(&mut p, 2).ok_or(LldpError::MalformedData)?;
+        match u16::from_be_bytes([field[0], field[1]]) {
+            0x8100 | 0x88a8 => {
                 take(&mut p, 2).ok_or(LldpError::MalformedData)?;
             }
-            [0x88, 0xcc] => break,
-            _ => return Ok(None),
+            value => break value,
         }
-    }
+    };
     // Provider/customer-scope LLDP can traverse intervening bridges. Only nearest-bridge
     // multicast supplies evidence for this single-link peer check.
     if addresses[..6] != [0x01, 0x80, 0xc2, 0x00, 0x00, 0x0e] {
         return Ok(None);
+    }
+    match type_or_length {
+        0x88cc => {}
+        length @ 0..=1500 => {
+            let payload = p
+                .get(..usize::from(length))
+                .ok_or(LldpError::MalformedData)?;
+            let Some(snap) = payload.strip_prefix(&[0xaa, 0xaa, 0x03]) else {
+                return Ok(None);
+            };
+            p = snap;
+            if take(&mut p, 5).ok_or(LldpError::MalformedData)? != [0, 0, 0, 0x88, 0xcc] {
+                return Ok(None);
+            }
+        }
+        _ => return Ok(None),
     }
     let chassis = wire_id(1, mandatory(&mut p, 1)?)?;
     let port = wire_id(2, mandatory(&mut p, 2)?)?;
@@ -210,6 +226,21 @@ fn advertisement(mut p: &[u8]) -> Result<Option<(LldpId, LldpId, u16)>, LldpErro
         }
     }
     Ok(Some((chassis, port, ttl)))
+}
+
+fn ethernet_fcs(frame: &[u8]) -> [u8; 4] {
+    let mut crc = u32::MAX;
+    for &byte in frame {
+        crc ^= u32::from(byte);
+        for _ in 0..8 {
+            crc = if crc & 1 != 0 {
+                (crc >> 1) ^ 0xedb8_8320
+            } else {
+                crc >> 1
+            };
+        }
+    }
+    (!crc).to_le_bytes()
 }
 
 /// The caller attests that every frame was received on the named, single-link interface.
@@ -288,7 +319,11 @@ pub fn check_lldp_pcap(
             return Err(TruncatedData);
         }
         let frame = take(&mut bytes, cap as usize).ok_or(TruncatedData)?;
-        let frame = &frame[..frame.len().checked_sub(fcs_bytes).ok_or(MalformedData)?];
+        let (frame, fcs) = frame.split_at(frame.len().checked_sub(fcs_bytes).ok_or(MalformedData)?);
+        // A corrupt record could hide a second neighbor or a withdrawal.
+        if fcs.len() == 4 && fcs != ethernet_fcs(frame) {
+            return Err(MalformedData);
+        }
         if let Some((chassis, port, ttl)) = advertisement(frame)? {
             latest.insert((chassis, port), (time, ttl));
         }

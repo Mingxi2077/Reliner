@@ -7,6 +7,7 @@ use std::{
 
 use crate::dynamic::{LearnedRoute, RoutingPlan};
 use crate::report::{possible_history_copy, reserve_history_append};
+use crate::stp::StpSlot;
 use crate::topology::{
     DEFAULT_TTL, DeviceIndex, DeviceKind, ECHO_HEADERS_BYTES, ForwardingForest, Interface,
     LinkChange, LinkIndex, LinkProtection, Mac, PortIndex, PortKind, ProbeConfig, ProbeIndex,
@@ -128,7 +129,7 @@ enum TableKey {
 enum Action {
     Link(usize),
     ConvergeRoute(usize),
-    ConvergeStp,
+    ConvergeStp(Option<usize>),
     Expire {
         key: TableKey,
         generation: EventId,
@@ -158,7 +159,7 @@ impl Action {
     fn phase(self) -> Phase {
         match self {
             Self::Link(_) => Phase::LinkChange,
-            Self::ConvergeRoute(_) | Self::ConvergeStp => Phase::Control,
+            Self::ConvergeRoute(_) | Self::ConvergeStp(_) => Phase::Control,
             Self::Transmit { .. } => Phase::Transmit,
             Self::Expire { .. } | Self::Deadline(_) => Phase::Timer,
             Self::Arrival(_) => Phase::Arrival,
@@ -265,10 +266,36 @@ impl Default for ProbeState {
 struct Observation {
     probe: ProbeIndex,
     port: PortIndex,
-    frame: FrameEvidence,
+    frame: ObservedFrame,
     fact: EvidenceFact,
     blocking: bool,
     routing_event: Option<NonZeroU64>,
+}
+
+#[derive(Clone, Copy)]
+enum ObservedFrame {
+    Existing(FrameEvidence),
+    Outgoing {
+        parent_id: Option<FrameId>,
+        kind: FrameKind,
+    },
+}
+
+impl ObservedFrame {
+    fn publish(self, sequence: &mut u64) -> FrameEvidence {
+        match self {
+            Self::Existing(frame) => frame,
+            Self::Outgoing { parent_id, kind } => {
+                // A synchronous loss has no arrival event to supply the child frame's ID.
+                *sequence += 1;
+                FrameEvidence {
+                    id: FrameId(*sequence),
+                    parent_id,
+                    kind,
+                }
+            }
+        }
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -296,7 +323,7 @@ struct RoutingTable {
 
 struct StpTree {
     active: Vec<bool>,
-    forest: ForwardingForest,
+    forest: ForwardingForest<u64>,
     event_id: EventId,
 }
 
@@ -306,8 +333,24 @@ impl StpTree {
     }
 }
 
+struct StpRuntime {
+    round: Option<ControlRound>,
+    tree: Option<StpTree>,
+    recovered: Vec<Option<EventId>>,
+    row_growth_work: usize,
+}
+
+// Initial history rows have dense global slots. Restore that order in at most one swap per row.
+fn order_initial_rows<T>(rows: &mut [(usize, T)]) {
+    for index in 0..rows.len() {
+        while rows[index].0 != index {
+            rows.swap(index, rows[index].0);
+        }
+    }
+}
+
 struct StpUpdate {
-    tree: StpTree,
+    trees: Vec<(usize, StpTree)>,
     event: StpEventHeader,
     bridges: Vec<(usize, StpBridgeState)>,
     links: Vec<(usize, StpLinkState)>,
@@ -341,7 +384,7 @@ struct Effects {
     route: Option<RouteChoice>,
     routing_round: Option<ControlRound>,
     routing_table: Option<Vec<LearnedRoute>>,
-    stp_round: Option<ControlRound>,
+    stp_round: Option<(usize, ControlRound)>,
     stp_update: Option<StpUpdate>,
 }
 
@@ -350,7 +393,7 @@ impl Effects {
         &mut self,
         probe: ProbeIndex,
         port: PortIndex,
-        frame: FrameEvidence,
+        frame: ObservedFrame,
         fact: EvidenceFact,
         blocking: bool,
     ) {
@@ -387,10 +430,8 @@ pub(crate) struct Simulation {
     routing_tables: Vec<Option<RoutingTable>>,
     routing_entries: usize,
     routing_events: Vec<RoutingEvent>,
-    stp_round: Option<ControlRound>,
-    stp_tree: Option<StpTree>,
-    stp_recovered: Vec<Option<EventId>>,
-    stp_mac_generation: u64,
+    stp_domains: Vec<StpRuntime>,
+    stp_entries: usize,
     stp_events: StpHistory,
     stp_facts: usize,
     trace: TraceReport,
@@ -409,11 +450,21 @@ impl Simulation {
             at_ns: plan.convergence_ns,
             trigger: None,
         });
-        let stp_links = topology.stp.as_ref().map_or(0, |plan| plan.link_count());
         let initial_stp_round = topology.stp.as_ref().map(|plan| ControlRound {
             at_ns: plan.convergence_ns,
             trigger: None,
         });
+        let stp_domains = topology
+            .stp
+            .iter()
+            .flat_map(|plan| &plan.domains)
+            .map(|domain| StpRuntime {
+                round: initial_stp_round,
+                tree: None,
+                recovered: vec![None; domain.link_count()],
+                row_growth_work: 0,
+            })
+            .collect();
         let mut sim = Self {
             links: vec![LinkState::default(); topology.links.len()],
             transmitters: HashMap::new(),
@@ -438,10 +489,8 @@ impl Simulation {
             routing_tables: (0..nodes).map(|_| None).collect(),
             routing_entries: 0,
             routing_events: Vec::new(),
-            stp_round: None,
-            stp_tree: None,
-            stp_recovered: vec![None; stp_links],
-            stp_mac_generation: 0,
+            stp_domains,
+            stp_entries: 0,
             stp_events: StpHistory::default(),
             stp_facts: 0,
             trace: TraceReport {
@@ -461,7 +510,7 @@ impl Simulation {
             + sim.topology.link_actions.len()
             + sim.topology.warmup.len()
             + sim.routing_event_count(initial_routing_round)
-            + sim.stp_event_count(initial_stp_round);
+            + usize::from(initial_stp_round.is_some_and(|r| r.at_ns <= sim.topology.end_ns));
         if declared > limits.pending_events {
             sim.exhaust(ResourceLimit::PendingEvents);
             return sim;
@@ -485,11 +534,15 @@ impl Simulation {
             sim.schedule_routing_round(round);
         }
         if let Some(round) = initial_stp_round {
-            for slot in 0..stp_links {
-                let link = sim.topology.stp.as_ref().unwrap().link_at(slot);
-                sim.adjust_forwarding_flood_work(link, false);
+            for domain in 0..sim.stp_domains.len() {
+                for slot in 0..sim.stp_domains[domain].recovered.len() {
+                    let link = sim.topology.stp.as_ref().unwrap().domains[domain].link_at(slot);
+                    sim.adjust_forwarding_flood_work(link, false);
+                }
             }
-            sim.schedule_stp_round(round);
+            if round.at_ns <= sim.topology.end_ns {
+                sim.schedule(round.at_ns, Action::ConvergeStp(None));
+            }
         }
         sim
     }
@@ -519,31 +572,18 @@ impl Simulation {
         }
     }
 
-    fn stp_event_count(&self, round: Option<ControlRound>) -> usize {
-        usize::from(round.is_some_and(|round| round.at_ns <= self.topology.end_ns))
-    }
-
-    fn schedule_stp_round(&mut self, round: ControlRound) {
-        self.stp_round = Some(round);
-        if self.stp_event_count(Some(round)) != 0 {
-            self.schedule(round.at_ns, Action::ConvergeStp);
-        }
-    }
-
     fn control_due(&self, at_ns: u64, current: Option<ControlRound>, delay: u64) -> Option<u64> {
         // Changes on the boundary belong to the already scheduled control phase.
         (current.is_none_or(|round| round.at_ns < at_ns) && delay <= self.topology.end_ns - at_ns)
             .then(|| at_ns + delay)
     }
 
-    fn stp_due(&self, at_ns: u64, change: LinkChange) -> Option<u64> {
+    fn stp_due(&self, at_ns: u64, change: LinkChange) -> Option<(usize, u64)> {
         let plan = self.topology.stp.as_ref()?;
-        self.control_due(at_ns, self.stp_round, plan.convergence_ns)
-            .filter(|_| {
-                change
-                    .updates()
-                    .any(|update| plan.slot(update.link).is_some())
-            })
+        // Two-member batches only occur for explicit protection, which excludes STP.
+        let domain = plan.slot(change.first.link)?.domain;
+        let due = self.control_due(at_ns, self.stp_domains[domain].round, plan.convergence_ns)?;
+        Some((domain, due))
     }
 
     fn routing_due(&self, at_ns: u64, change: LinkChange) -> Option<u64> {
@@ -559,31 +599,68 @@ impl Simulation {
         };
         Effects {
             routing_round: self.routing_due(point.at_ns, change).map(round),
-            stp_round: self.stp_due(point.at_ns, change).map(round),
+            stp_round: self
+                .stp_due(point.at_ns, change)
+                .map(|(domain, time)| (domain, round(time))),
             ..Effects::default()
         }
     }
 
-    fn stage_stp(&self, point: Point) -> StpUpdate {
+    fn stage_stp(&self, point: Point, domain: Option<usize>) -> StpUpdate {
         let plan = self.topology.stp.as_ref().expect("spanning tree plan");
-        let snapshot = plan.select(&self.topology, &self.stp_events, |link| {
-            self.links[link].down_event.is_none()
+        // Bootstrap publishes the complete initial history. Later clocks publish only their domain.
+        let range = domain.map_or(0..plan.domains.len(), |index| index..index + 1);
+        let trigger = domain.and_then(|index| {
+            self.stp_domains[index]
+                .round
+                .expect("scheduled STP round")
+                .trigger
         });
-        let forest = plan.forest.build(&snapshot.active);
-        StpUpdate {
-            tree: StpTree {
-                active: snapshot.active,
-                forest,
-                event_id: point.id,
-            },
+        let merged = range.len() > 1;
+        let (bridge_rows, link_rows) = if merged { plan.initial_rows() } else { (0, 0) };
+        let mut update = StpUpdate {
+            trees: Vec::with_capacity(range.len()),
             event: StpEventHeader {
                 event_id: point.id,
                 at_ns: point.at_ns,
-                triggered_by_link_event_id: self.stp_round.expect("scheduled STP round").trigger,
+                triggered_by_link_event_id: trigger,
             },
-            bridges: snapshot.bridges,
-            links: snapshot.links,
+            bridges: Vec::with_capacity(bridge_rows),
+            links: Vec::with_capacity(link_rows),
+        };
+        for index in range {
+            let domain = &plan.domains[index];
+            let snapshot = domain.select(&self.topology, &self.stp_events, |link| {
+                self.links[link].down_event.is_none()
+            });
+            let forest = domain.forest.build(
+                &snapshot.active,
+                self.stp_domains[index]
+                    .tree
+                    .as_ref()
+                    .map(|tree| &tree.forest),
+            );
+            update.trees.push((
+                index,
+                StpTree {
+                    active: snapshot.active,
+                    forest,
+                    event_id: point.id,
+                },
+            ));
+            if !merged {
+                update.bridges = snapshot.bridges;
+                update.links = snapshot.links;
+            } else {
+                update.bridges.extend(snapshot.bridges);
+                update.links.extend(snapshot.links);
+            }
         }
+        if merged {
+            order_initial_rows(&mut update.bridges);
+            order_initial_rows(&mut update.links);
+        }
+        update
     }
 
     fn exhaust(&mut self, limit: ResourceLimit) {
@@ -635,7 +712,9 @@ impl Simulation {
                                                 .link
                                                 .and_then(|link| plan.slot(link.link))
                                                 .is_some_and(|slot| {
-                                                    self.stp_recovered[slot].is_some()
+                                                    self.stp_domains[slot.domain].recovered
+                                                        [slot.local]
+                                                        .is_some()
                                                 })
                                     });
                                     if skipped { 1 } else { target.filter_work() }
@@ -708,9 +787,11 @@ impl Simulation {
                     self.topology.routing.as_ref().expect("routing plan").work
                         + possible_history_copy(self.routing_events.len())
                 }
-                Action::ConvergeStp => {
-                    self.topology.stp.as_ref().expect("spanning tree plan").work
-                        + self.stp_events.append_work()
+                Action::ConvergeStp(domain) => {
+                    let plan = self.topology.stp.as_ref().expect("spanning tree plan");
+                    domain.map_or(plan.work, |i| {
+                        plan.domains[i].work + self.stp_domains[i].row_growth_work
+                    }) + possible_history_copy(self.stp_events.len())
                 }
                 _ => 0,
             },
@@ -748,8 +829,8 @@ impl Simulation {
                     ..Effects::default()
                 })
             }
-            Action::ConvergeStp => Ok(Effects {
-                stp_update: Some(self.stage_stp(point)),
+            Action::ConvergeStp(domain) => Ok(Effects {
+                stp_update: Some(self.stage_stp(point, domain)),
                 ..Effects::default()
             }),
             _ => Ok(Effects::default()),
@@ -767,7 +848,7 @@ impl Simulation {
             + usize::from(effects.expiry.is_some())
             + queued_replacement
             + self.routing_event_count(effects.routing_round)
-            + self.stp_event_count(effects.stp_round)
+            + usize::from(effects.stp_round.is_some())
             > self.limits.pending_events
         {
             self.exhaust(ResourceLimit::PendingEvents);
@@ -793,12 +874,18 @@ impl Simulation {
             }
             _ => self.routing_entries,
         };
-        let stp_entries = effects
-            .stp_update
-            .as_ref()
-            .map(|update| &update.tree)
-            .or(self.stp_tree.as_ref())
-            .map_or(0, StpTree::entries);
+        let stp_entries = if matches!(event.action, Action::ConvergeStp(None)) {
+            effects
+                .stp_update
+                .as_ref()
+                .expect("initial trees")
+                .trees
+                .iter()
+                .map(|(_, t)| t.entries())
+                .sum()
+        } else {
+            self.stp_entries
+        };
         if self.arp.len()
             + self.mac.len()
             + self.pending_count
@@ -916,19 +1003,43 @@ impl Simulation {
         }
     }
 
-    fn stp_forwards(&self, slot: usize) -> bool {
-        self.stp_tree.as_ref().is_some_and(|tree| tree.active[slot])
+    fn stp_forwards(&self, slot: StpSlot) -> bool {
+        self.stp_domains[slot.domain]
+            .tree
+            .as_ref()
+            .is_some_and(|tree| tree.active[slot.local])
+    }
+
+    fn stp_forest(
+        &self,
+        port: PortIndex,
+    ) -> Option<(&crate::topology::StpForestPlan, &ForwardingForest<u64>)> {
+        let plan = self.topology.stp.as_ref()?;
+        let domain = plan.forest_domain[port]?;
+        Some((
+            &plan.domains[domain].forest,
+            &self.stp_domains[domain].tree.as_ref()?.forest,
+        ))
+    }
+
+    fn stp_mac_generation(&self, port: PortIndex) -> u64 {
+        self.stp_forest(port)
+            .map_or(0, |(plan, forest)| plan.mac_generation(forest, port))
     }
 
     fn required_branch(&self, port: PortIndex, wire: WireFrame, stage: PortStage) -> bool {
-        let forest = self.stp_tree.as_ref().map(|tree| &tree.forest);
-        self.topology
-            .on_required_branch(forest, wire.origin, wire.neighbor, port, stage)
+        self.topology.on_required_branch(
+            self.stp_forest(port),
+            wire.origin,
+            wire.neighbor,
+            port,
+            stage,
+        )
     }
 
     fn known_mac_port(&self, key: MacKey) -> Option<PortIndex> {
         let learned = &self.mac.get(&key)?.value;
-        if learned.stp_generation != self.stp_mac_generation {
+        if learned.stp_generation != self.stp_mac_generation(learned.port) {
             return None;
         }
         let link = self.topology.ports[learned.port]
@@ -979,7 +1090,7 @@ impl Simulation {
             self.observe_drop(
                 arrival.port,
                 arrival.wire,
-                point.frame(),
+                Some(point.frame()),
                 PortStage::Ingress,
                 fact,
                 &mut effects,
@@ -1009,7 +1120,7 @@ impl Simulation {
                 self.observe_drop(
                     arrival.port,
                     frame,
-                    point.frame(),
+                    Some(point.frame()),
                     PortStage::Ingress,
                     || reject.fact(PortStage::Ingress),
                     effects,
@@ -1018,7 +1129,7 @@ impl Simulation {
             }
         };
         let device = self.topology.ports[arrival.port].device;
-        if frame.stp_generation == self.stp_mac_generation {
+        if frame.stp_generation == self.stp_mac_generation(arrival.port) {
             self.learn(
                 point,
                 Learning::Mac {
@@ -1050,11 +1161,11 @@ impl Simulation {
                 if !self.stp_forwards(slot) {
                     continue;
                 }
-                if let Some(up_event_id) = self.stp_recovered[slot] {
+                if let Some(up_event_id) = self.stp_domains[slot.domain].recovered[slot.local] {
                     self.observe_drop(
                         egress,
                         frame,
-                        point.frame(),
+                        Some(point.frame()),
                         PortStage::Egress,
                         || EvidenceFact::StpAwaitingConvergence {
                             link_id: self.topology.links[attachment.link].id.clone(),
@@ -1073,7 +1184,7 @@ impl Simulation {
                         self.observe_drop(
                             egress,
                             frame,
-                            point.frame(),
+                            Some(point.frame()),
                             PortStage::Egress,
                             || self.protection_unavailable(pair),
                             effects,
@@ -1100,7 +1211,7 @@ impl Simulation {
                 Err(reject) => self.observe_drop(
                     egress,
                     frame,
-                    point.frame(),
+                    Some(point.frame()),
                     PortStage::Egress,
                     || reject.fact(PortStage::Egress),
                     effects,
@@ -1122,7 +1233,7 @@ impl Simulation {
             self.observe_drop(
                 arrival.port,
                 wire,
-                point.frame(),
+                Some(point.frame()),
                 PortStage::Ingress,
                 || EvidenceFact::Discarded {
                     stage: PortStage::Ingress,
@@ -1191,7 +1302,7 @@ impl Simulation {
                     effects.observe(
                         probe,
                         arrival.port,
-                        wire.evidence(point.frame()),
+                        ObservedFrame::Existing(wire.evidence(point.frame())),
                         EvidenceFact::ArpResolved,
                         false,
                     );
@@ -1238,7 +1349,13 @@ impl Simulation {
                         Some(EvidenceFact::EchoRequestReceived)
                     };
                     if let Some(fact) = fact {
-                        effects.observe(ip.probe, arrival.port, packet_frame, fact, false);
+                        effects.observe(
+                            ip.probe,
+                            arrival.port,
+                            ObservedFrame::Existing(packet_frame),
+                            fact,
+                            false,
+                        );
                     }
                 }
                 if ip.reply {
@@ -1258,7 +1375,7 @@ impl Simulation {
                     arrival.port,
                     PortStage::Ingress,
                     ip,
-                    packet_frame,
+                    ObservedFrame::Existing(packet_frame),
                     effects,
                 ) {
                     return Ok(());
@@ -1267,7 +1384,7 @@ impl Simulation {
                     self.observe_ip_loss(
                         arrival.port,
                         ip,
-                        packet_frame,
+                        ObservedFrame::Existing(packet_frame),
                         EvidenceFact::Ipv4TtlExpired {
                             received_ttl: ip.ttl,
                         },
@@ -1301,14 +1418,9 @@ impl Simulation {
         let routing = self.dynamic_table(device);
         let mut learned = None;
         let decision = match &self.topology.devices[device].kind {
-            DeviceKind::Host { gateway } => {
-                let next = if from_interface.on_link(packet.destination) {
-                    Some(packet.destination)
-                } else {
-                    *gateway
-                };
-                next.map(|next| ((from, next), None))
-            }
+            DeviceKind::Host { gateway } => from_interface
+                .host_next_hop(packet.destination, *gateway)
+                .map(|next| ((from, next), None)),
             DeviceKind::Router { routes } => {
                 let configured = routes.iter().copied().find(|route| {
                     route.matches(packet.destination)
@@ -1342,13 +1454,18 @@ impl Simulation {
             DeviceKind::Switch => unreachable!("IP source"),
         };
         let packet_kind = Packet::Ip(packet).kind();
-        let frame = incoming
-            .filter(|frame| frame.kind == packet_kind)
-            .unwrap_or(FrameEvidence {
-                id: point.frame(),
-                parent_id: incoming.map(|frame| frame.id),
+        let frame = match incoming {
+            Some(parent) if parent.kind != packet_kind => ObservedFrame::Outgoing {
+                parent_id: Some(parent.id),
                 kind: packet_kind,
-            });
+            },
+            Some(frame) => ObservedFrame::Existing(frame),
+            None => ObservedFrame::Existing(FrameEvidence {
+                id: point.frame(),
+                parent_id: None,
+                kind: packet_kind,
+            }),
+        };
         let Some((key, prefix)) = decision else {
             self.observe_ip_loss(
                 from,
@@ -1415,7 +1532,7 @@ impl Simulation {
                 self.observe_ip_loss(
                     key.0,
                     packet,
-                    incoming.unwrap_or(frame),
+                    incoming.map_or(frame, ObservedFrame::Existing),
                     EvidenceFact::Ipv4MtuExceeded {
                         event_id: point.id,
                         packet_kind,
@@ -1457,7 +1574,7 @@ impl Simulation {
         port: PortIndex,
         direction: PortStage,
         packet: IpPacket,
-        frame: FrameEvidence,
+        frame: ObservedFrame,
         effects: &mut Effects,
     ) -> bool {
         let Some((action, matched_rule)) = self.topology.ports[port]
@@ -1491,7 +1608,7 @@ impl Simulation {
         &self,
         port: PortIndex,
         packet: IpPacket,
-        frame: FrameEvidence,
+        frame: ObservedFrame,
         fact: EvidenceFact,
         effects: &mut Effects,
     ) {
@@ -1520,7 +1637,7 @@ impl Simulation {
             origin: port,
             neighbor,
             parent_id: pending.parent_id,
-            stp_generation: self.stp_mac_generation,
+            stp_generation: self.stp_mac_generation(port),
             required_at_send: None,
             routing_event: pending.routing_event,
         };
@@ -1549,7 +1666,7 @@ impl Simulation {
             origin: port,
             neighbor,
             parent_id,
-            stp_generation: self.stp_mac_generation,
+            stp_generation: self.stp_mac_generation(port),
             required_at_send: None,
             routing_event: None,
         }
@@ -1571,7 +1688,7 @@ impl Simulation {
             self.observe_drop(
                 port,
                 wire,
-                point.frame(),
+                None,
                 PortStage::Egress,
                 || EvidenceFact::LinkDown {
                     link_id: link.id.clone(),
@@ -1581,7 +1698,7 @@ impl Simulation {
             );
             return Ok(());
         }
-        if self.stp_tree.is_some() {
+        if !self.stp_events.is_empty() {
             wire.required_at_send = Some(
                 wire.required_at_send.unwrap_or(true)
                     && self.required_branch(port, wire, PortStage::Egress),
@@ -1631,7 +1748,7 @@ impl Simulation {
             self.observe_drop(
                 port,
                 wire,
-                point.frame(),
+                None,
                 PortStage::Egress,
                 || EvidenceFact::TransmitQueueFull {
                     event_id: point.id,
@@ -1666,7 +1783,7 @@ impl Simulation {
         &self,
         port: PortIndex,
         wire: WireFrame,
-        id: FrameId,
+        existing_id: Option<FrameId>,
         stage: PortStage,
         fact: impl FnOnce() -> EvidenceFact,
         effects: &mut Effects,
@@ -1715,7 +1832,13 @@ impl Simulation {
             effects.observations.push(Observation {
                 probe: index,
                 port,
-                frame: wire.evidence(id),
+                frame: match existing_id {
+                    Some(id) => ObservedFrame::Existing(wire.evidence(id)),
+                    None => ObservedFrame::Outgoing {
+                        parent_id: wire.parent_id,
+                        kind: wire.packet.kind(),
+                    },
+                },
                 fact: fact(),
                 blocking,
                 routing_event: wire.routing_event,
@@ -1796,9 +1919,10 @@ impl Simulation {
                 .and_then(|plan| plan.slot(update.link))
                 && self.stp_forwards(slot)
             {
-                let held = self.stp_recovered[slot].is_some();
+                let held = self.stp_domains[slot.domain].recovered[slot.local].is_some();
                 let recovering = update.state == LinkStatus::Up;
-                self.stp_recovered[slot] = recovering.then_some(point.id);
+                self.stp_domains[slot.domain].recovered[slot.local] =
+                    recovering.then_some(point.id);
                 if held != recovering {
                     self.adjust_forwarding_flood_work(update.link, !recovering);
                 }
@@ -1850,27 +1974,45 @@ impl Simulation {
         self.link_facts += change.update_count();
     }
 
-    fn commit_stp(&mut self, point: Point, update: StpUpdate) {
-        for (slot, &active) in update.tree.active.iter().enumerate() {
-            let previous = self.stp_forwards(slot);
-            let held = self.stp_recovered[slot].take().is_some();
-            let link = self.topology.stp.as_ref().unwrap().link_at(slot);
-            if (previous && !held) != active {
-                self.adjust_forwarding_flood_work(link, active);
-            }
-            if previous == active {
-                continue;
-            }
-            if !active && self.links[link].down_event.is_none() {
-                self.invalidate_link(link, LinkInvalidation::SpanningTreeChanged(point));
-            }
-            // A port that remains forwarding can now lead away from a learned destination.
-            self.stp_mac_generation = point.id.0;
-        }
+    fn commit_stp(&mut self, point: Point, scope: Option<usize>, update: StpUpdate) {
         self.stp_facts += update.facts();
-        self.stp_tree = Some(update.tree);
+        for (domain, mut tree) in update.trees {
+            if self.stp_domains[domain].tree.is_none() {
+                self.stp_entries += tree.entries();
+            }
+            for (local, &active) in tree.active.iter().enumerate() {
+                let previous = self.stp_forwards(StpSlot { domain, local });
+                let held = self.stp_domains[domain].recovered[local].take().is_some();
+                let link = self.topology.stp.as_ref().unwrap().domains[domain].link_at(local);
+                if (previous && !held) != active {
+                    self.adjust_forwarding_flood_work(link, active);
+                }
+                if previous == active {
+                    continue;
+                }
+                if !active && self.links[link].down_event.is_none() {
+                    self.invalidate_link(link, LinkInvalidation::SpanningTreeChanged(point));
+                }
+                self.topology.stp.as_ref().unwrap().domains[domain]
+                    .forest
+                    .invalidate_macs(
+                        &mut tree.forest,
+                        self.topology.links[link].ports,
+                        point.id.0,
+                    );
+            }
+            self.stp_domains[domain].round = None;
+            self.stp_domains[domain].tree = Some(tree);
+        }
+        // Only this domain can append to its rows. Header growth is shared by all publications.
+        let previous_growth = self.stp_events.row_growth_work();
         self.stp_events
             .push(update.event, update.bridges, update.links);
+        if let Some(domain) = scope {
+            let other_domains = previous_growth - self.stp_domains[domain].row_growth_work;
+            self.stp_domains[domain].row_growth_work =
+                self.stp_events.row_growth_work() - other_domains;
+        }
     }
 
     fn commit(&mut self, point: Point, action: Action, mut effects: Effects) {
@@ -1880,12 +2022,14 @@ impl Simulation {
                 if let Some(round) = effects.routing_round {
                     self.schedule_routing_round(round);
                 }
-                if let Some(round) = effects.stp_round {
-                    self.schedule_stp_round(round);
+                if let Some((domain, round)) = effects.stp_round {
+                    self.stp_domains[domain].round = Some(round);
+                    self.schedule(round.at_ns, Action::ConvergeStp(Some(domain)));
                 }
             }
-            Action::ConvergeStp => self.commit_stp(
+            Action::ConvergeStp(domain) => self.commit_stp(
                 point,
+                domain,
                 effects.stp_update.take().expect("staged spanning tree"),
             ),
             Action::ConvergeRoute(node) => {
@@ -1975,7 +2119,7 @@ impl Simulation {
                         value: LearnedMac {
                             port,
                             link_generation: self.links[link].generation,
-                            stp_generation: self.stp_mac_generation,
+                            stp_generation: self.stp_mac_generation(port),
                         },
                         generation: point.id,
                     },
@@ -2042,6 +2186,7 @@ impl Simulation {
             }
         }
         for mut observation in effects.observations {
+            let frame = observation.frame.publish(&mut self.sequence);
             let state = &mut self.probes[observation.probe];
             let id = EvidenceId(self.evidence.len() as u64 + 1);
             match &mut observation.fact {
@@ -2060,12 +2205,17 @@ impl Simulation {
                     request_evidence_id,
                     ..
                 } => *request_evidence_id = state.request,
-                EvidenceFact::Ipv4MtuExceeded { .. }
-                    if state.waiting_for == WaitingFor::ArpReply =>
-                {
-                    state.waiting_for = WaitingFor::ProbeDeadline;
-                }
                 _ => {}
+            }
+            if matches!(action, Action::Start(_))
+                && matches!(
+                    observation.fact,
+                    EvidenceFact::Ipv4RouteMiss { .. }
+                        | EvidenceFact::Ipv4NeighborNotUnicast { .. }
+                        | EvidenceFact::Ipv4MtuExceeded { .. }
+                )
+            {
+                state.waiting_for = WaitingFor::ProbeDeadline;
             }
             if observation.blocking && state.cause.is_none() {
                 state.cause = Some(id);
@@ -2089,8 +2239,11 @@ impl Simulation {
                     [observation.port]
                     .link
                     .and_then(|attachment| {
-                        self.topology.stp.as_ref()?.slot(attachment.link)?;
-                        self.stp_tree.as_ref().map(|tree| tree.event_id)
+                        let slot = self.topology.stp.as_ref()?.slot(attachment.link)?;
+                        self.stp_domains[slot.domain]
+                            .tree
+                            .as_ref()
+                            .map(|tree| tree.event_id)
                     }),
                 _ => None,
             };
@@ -2100,7 +2253,7 @@ impl Simulation {
                     id,
                     at_ns: point.at_ns,
                     port: self.topology.port_reference(observation.port),
-                    frame: observation.frame,
+                    frame,
                     fact: observation.fact,
                     protected_link,
                     stp_event_id,
@@ -2122,7 +2275,7 @@ impl Simulation {
         let (event, frame, port, probe) = match action {
             Action::Link(_) => (TraceEvent::LinkChange, None, None, None),
             Action::ConvergeRoute(_) => (TraceEvent::RoutingConvergence, None, None, None),
-            Action::ConvergeStp => (TraceEvent::StpConvergence, None, None, None),
+            Action::ConvergeStp(_) => (TraceEvent::StpConvergence, None, None, None),
             Action::Expire { .. } => (TraceEvent::TableExpiry, None, None, None),
             Action::Deadline(probe) => (TraceEvent::ProbeDeadline, None, None, Some(probe)),
             Action::Transmit { arrival, .. } => (
@@ -2307,19 +2460,7 @@ impl Simulation {
         };
         RunReport::Scenario(ScenarioReport {
             report_version: version,
-            model_version: if has_acls {
-                13
-            } else if self.topology.native_vlan_count != 0 {
-                12
-            } else if self.topology.format_version == 3 {
-                11
-            } else if routing.is_some() {
-                10
-            } else if stp.is_some() {
-                8
-            } else {
-                version
-            },
+            model_version: 14,
             topology_id: self.topology.id,
             revision: self.topology.revision,
             settings: ScenarioSettings {

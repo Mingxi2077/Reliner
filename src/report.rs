@@ -656,8 +656,8 @@ impl StpHistory {
         (0..self.len()).map(|index| self.get(index).expect("existing STP event"))
     }
 
-    pub(crate) fn append_work(&self) -> usize {
-        self.row_growth_work + possible_history_copy(self.len())
+    pub(crate) fn row_growth_work(&self) -> usize {
+        self.row_growth_work
     }
 
     pub(crate) fn current_bridge(&self, row: usize) -> Option<&StpBridgeState> {

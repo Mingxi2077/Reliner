@@ -13,6 +13,8 @@ pub struct IosInterface {
     pub mode: Map<String, Value>,
     pub field_lines: BTreeMap<&'static str, usize>,
     pub gaps: Vec<IosGap>,
+    #[serde(skip_serializing_if = "Map::is_empty")]
+    pub context: Map<String, Value>,
 }
 
 #[derive(Debug, Serialize)]
@@ -92,6 +94,7 @@ impl IosInterface {
             mode: Map::new(),
             field_lines: BTreeMap::new(),
             gaps: Vec::new(),
+            context: Map::new(),
         }
     }
 
@@ -103,6 +106,20 @@ impl IosInterface {
         path: &str,
     ) -> Result<(), ImportError> {
         let bad = |message| source_error(&format!("{path}/lines/{number}"), message);
+        let positive = words
+            .strip_prefix(&["no"])
+            .or_else(|| words.strip_prefix(&["default"]))
+            .unwrap_or(words);
+        if positive.starts_with(&["switchport", "trunk", "native", "vlan", "tag"]) {
+            self.context
+                .insert("native_tagging_override_line".into(), json!(number));
+            self.gaps.push(IosGap {
+                line: Some(number),
+                field: "native_tagging",
+                message: "接口 Native VLAN 标记覆盖未映射。",
+            });
+            return Ok(());
+        }
         match words {
             ["switchport"] | ["switchport", "trunk", "encapsulation", "dot1q"] => {}
             ["switchport", "mode", kind @ ("access" | "trunk")] => {
@@ -130,11 +147,7 @@ impl IosInterface {
                 self.record("allowed_vlans", json!(values), number);
             }
             _ => {
-                let field = match words
-                    .strip_prefix(&["no"])
-                    .or_else(|| words.strip_prefix(&["default"]))
-                    .unwrap_or(words)
-                {
+                let field = match positive {
                     ["switchport", "mode", ..] | ["switchport"] => "kind",
                     ["switchport", "access", "vlan", ..] => "vlan",
                     ["switchport", "trunk", "native", "vlan", ..] => "native_vlan",
@@ -158,7 +171,38 @@ impl IosInterface {
         Ok(())
     }
 
-    pub(crate) fn require_mode_fields(&mut self, kind: Option<&str>) {
+    pub(crate) fn finish(&mut self, global_tag_line: Option<usize>) {
+        let tag_line = self
+            .context
+            .get("native_tagging_override_line")
+            .and_then(Value::as_u64)
+            .map(|n| n as usize)
+            .or(global_tag_line);
+        let kind = self
+            .mode
+            .get("kind")
+            .and_then(Value::as_str)
+            .map(str::to_owned);
+        if let Some(line) = tag_line {
+            if let Some(value) = self.mode.remove("native_vlan") {
+                let declared = self.field_lines.remove("native_vlan").unwrap();
+                self.context.insert(
+                    "configured_native_vlan".into(),
+                    json!({"value":value,"line":declared}),
+                );
+            }
+            if kind.as_deref() != Some("access") {
+                self.gaps.push(IosGap {
+                    line: Some(line),
+                    field: "native_vlan",
+                    message: "Native VLAN 标记配置影响未标记转发，未导入未标记 VLAN。",
+                });
+            }
+        }
+        self.require_mode_fields(kind.as_deref());
+    }
+
+    fn require_mode_fields(&mut self, kind: Option<&str>) {
         let fields: &[&str] = match kind {
             Some("access") => &["vlan"],
             Some("trunk") => &["allowed_vlans", "native_vlan"],
@@ -275,12 +319,7 @@ fn parse(config: &str, path: &str) -> Result<IosInterface, ImportError> {
         }
         result.command(&words, &mut vlan_entries, number, path)?;
     }
-    let kind = result
-        .mode
-        .get("kind")
-        .and_then(Value::as_str)
-        .map(str::to_owned);
-    result.require_mode_fields(kind.as_deref());
+    result.finish(None);
     result.gaps.push(IosGap {
         line: None,
         field: "device_context",
@@ -318,28 +357,54 @@ pub(crate) fn apply(
     let fields = merge_mode(&mut parsed, port, path)?;
     parsed.mode.retain(|key, _| fields.contains(&key.as_str()));
     parsed.field_lines.retain(|key, _| fields.contains(key));
-    source.metadata.insert(
-        path.into(),
-        json!({
-            "format":"cisco_ios_interface","interface":parsed.interface,"mode":parsed.mode,"field_lines":parsed.field_lines
-        }),
-    );
+    let mut metadata = json!({
+        "format":"cisco_ios_interface","interface":parsed.interface,"mode":parsed.mode,"field_lines":parsed.field_lines
+    });
+    if !parsed.context.is_empty() {
+        metadata["context"] = Value::Object(parsed.context);
+    }
+    source.metadata.insert(path.into(), metadata);
+    let mut occurrences = BTreeMap::new();
     for issue in parsed.gaps {
-        let location = match issue.line {
-            Some(line) => format!("{path}/lines/{line}"),
-            None => child(path, issue.field),
-        };
-        gap(
+        record_issue(
             source,
-            &location,
+            &mut occurrences,
+            path,
+            path,
             ImportScope::Port {
                 port_id: port_id.into(),
             },
-            &json!({"line":issue.line,"field":issue.field}),
-            issue.message,
+            &issue,
         );
     }
     Ok(canonical)
+}
+
+pub(crate) fn record_issue(
+    source: &mut ImportSource,
+    occurrences: &mut BTreeMap<String, usize>,
+    path: &str,
+    fallback: &str,
+    scope: ImportScope,
+    issue: &IosGap,
+) {
+    let location = issue.line.map_or_else(
+        || child(fallback, issue.field),
+        |line| format!("{path}/lines/{line}"),
+    );
+    gap(
+        source,
+        &location,
+        scope,
+        &json!({"field":issue.field,"line":issue.line}),
+        issue.message,
+    );
+    let count = occurrences.entry(location).or_default();
+    *count += 1;
+    if *count > 1 {
+        let last = source.gaps.last_mut().expect("just added this gap");
+        last.id.push_str(&format!("#{count}"));
+    }
 }
 
 pub(crate) fn merge_mode(

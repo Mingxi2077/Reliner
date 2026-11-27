@@ -294,6 +294,46 @@ fn source_decimal_fields_are_validated_on_both_read_and_write() {
 }
 
 #[test]
+fn dropped_frame_parent_is_checked_using_the_recorded_model_version() {
+    let mut doc: Value = serde_json::from_str(LABS[1]).unwrap();
+    doc["scenario"]["link_actions"] = json!([{"link":"r1-r2","at_ns":"1050","state":"down"}]);
+    let report = run_lab(&doc.to_string()).unwrap();
+    let mut value: Value = serde_json::from_slice(&archive(&report, None)).unwrap();
+    assert_eq!(value["report"]["model_version"], 14);
+    let row = value["report"]["evidence"]
+        .as_array_mut()
+        .unwrap()
+        .iter_mut()
+        .find(|row| row["fact"]["kind"] == "link_down")
+        .unwrap();
+    assert_ne!(row["frame"]["parent_id"], row["frame"]["id"]);
+    row["frame"]["parent_id"] = row["frame"]["id"].clone();
+    assert!(
+        archive_error(&value)
+            .to_string()
+            .contains("/frame/parent_id")
+    );
+
+    // Older models used the incoming frame ID for a synchronous outgoing drop.
+    value["report"]["model_version"] = json!(2);
+    assert!(reopen(&value).is_ok());
+}
+
+#[test]
+fn a_timeout_cannot_cite_successful_request_delivery_as_its_cause() {
+    let report = run_lab(include_str!("../examples/acl-lab.json")).unwrap();
+    let mut value: Value = serde_json::from_slice(&archive(&report, None)).unwrap();
+    let probe = &mut value["report"]["probes"][0];
+    let delivery = probe["request_evidence_id"].as_str().unwrap().to_owned();
+    probe["outcome"]["cause"] = json!(delivery);
+    assert!(
+        archive_error(&value)
+            .to_string()
+            .contains("/probes/0/outcome/cause")
+    );
+}
+
+#[test]
 fn missing_cause_and_cross_probe_evidence_references_are_rejected() {
     let report = run_lab(LABS[7]).unwrap();
     let mut value: Value = serde_json::from_slice(&archive(&report, None)).unwrap();

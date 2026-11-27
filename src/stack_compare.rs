@@ -8,7 +8,7 @@ use crate::real_stack::{
     EchoOutcome, KernelLookupObservation, LINUX_KERNEL_STATIC, ProbeObservation, RealStackError,
     RealStackPlan, StackObservation, StackProbe, plan_real_stack,
 };
-use crate::topology::{DeviceKind, Topology};
+use crate::topology::{DeviceKind, Topology, netmask};
 use crate::{Evidence, EvidenceFact, EvidenceId, FrameKind, Outcome, RunReport, run_lab};
 
 #[derive(Debug, PartialEq, Eq, Serialize)]
@@ -156,6 +156,8 @@ pub struct FrrNexthop {
     pub ip: Ipv4Addr,
     #[serde(rename = "interfaceName")]
     pub ifname: String,
+    #[serde(rename = "interfaceIndex", skip_serializing_if = "Option::is_none")]
+    pub ifindex: Option<u32>,
     #[serde(default)]
     pub active: bool,
     #[serde(default)]
@@ -193,6 +195,8 @@ struct CaptureCommand {
     argv: Vec<String>,
     exit_code: i32,
     stdout: Value,
+    #[serde(default)]
+    stderr: String,
 }
 
 impl CaptureCommand {
@@ -226,10 +230,18 @@ fn match_status(matches: bool) -> ComparisonStatus {
     }
 }
 
+fn ipv4_prefix(value: &str) -> Option<(Ipv4Addr, u8)> {
+    let (address, length) = value.split_once('/')?;
+    let address = address.parse().ok()?;
+    let length = length.parse().ok()?;
+    (length <= 32).then_some((address, length))
+}
+
 fn external_phase(
     sample: &FrrSample,
     prefix: &str,
     dev: &str,
+    ifindex: Option<u32>,
     via: Ipv4Addr,
     installed: bool,
 ) -> Result<ExternalFrrPhase, RealStackError> {
@@ -240,11 +252,7 @@ fn external_phase(
         .as_object()
         .ok_or_else(|| invalid("expected a Zebra static route table"))?;
     // A daemon diagnostic object cannot establish that the route was withdrawn.
-    if !table.keys().all(|key| {
-        key.split_once('/').is_some_and(|(ip, len)| {
-            ip.parse::<Ipv4Addr>().is_ok() && len.parse::<u8>().is_ok_and(|n| n <= 32)
-        })
-    }) {
+    if !table.keys().all(|key| ipv4_prefix(key).is_some()) {
         return Err(invalid(
             "expected a Zebra static route table keyed by IPv4 prefix",
         ));
@@ -275,6 +283,12 @@ fn external_phase(
     let output = sample.kernel.output(&[
         "ip", "-N", "-j", "-4", "route", "show", "table", "main", "exact", prefix,
     ])?;
+    if !sample.kernel.stderr.trim().is_empty() {
+        return Err(invalid(format!(
+            "kernel route dump for {prefix} reported: {}",
+            sample.kernel.stderr.trim_end()
+        )));
+    }
     let entries = output
         .as_array()
         .ok_or_else(|| invalid("kernel route output must be an array"))?;
@@ -328,7 +342,14 @@ fn external_phase(
         rib.as_ref().is_some_and(|r| {
             r.selected && r.dest_selected && r.installed && {
                 let hop = &r.nexthops[0];
-                hop.active && hop.fib && hop.ifname == dev && hop.ip == via
+                hop.active
+                    && hop.fib
+                    && hop.ifname == dev
+                    && hop.ip == via
+                    && hop
+                        .ifindex
+                        .zip(ifindex)
+                        .is_none_or(|(rib, link)| rib == link)
             }
         })
     } else {
@@ -426,8 +447,27 @@ pub fn compare_external_frr_route(
             "external interface address does not match the modeled egress",
         ));
     }
-    let installed = external_phase(&c.installed, &c.prefix, &c.ifname, route.next_hop, true)?;
-    let withdrawn = external_phase(&c.withdrawn, &c.prefix, &c.ifname, route.next_hop, false)?;
+    let ifindex = link
+        .get("ifindex")
+        .map(u32::deserialize)
+        .transpose()
+        .map_err(|e| invalid(format!("invalid external interface index: {e}")))?;
+    let installed = external_phase(
+        &c.installed,
+        &c.prefix,
+        &c.ifname,
+        ifindex,
+        route.next_hop,
+        true,
+    )?;
+    let withdrawn = external_phase(
+        &c.withdrawn,
+        &c.prefix,
+        &c.ifname,
+        ifindex,
+        route.next_hop,
+        false,
+    )?;
     Ok(ExternalFrrRouteComparison {
         scope: "external_frr_route_comparison",
         native_id: c.native_id,
@@ -702,16 +742,24 @@ fn compare_fib(
             }
             let expected = expected_fib(plan, topology, i, from, destination);
             let lookup = lookups.get(&(direction, i));
-            // ip route get can report dst/32, not the installed route's matching prefix.
-            let selected = lookup
-                .and_then(|entry| entry.selected.as_ref())
-                .map(|route| FibSelection {
-                    egress_port: route.egress_port.clone(),
-                    gateway: route.gateway,
-                });
+            let route = lookup.and_then(|entry| entry.selected.as_ref());
+            // A host-specific route-get result and a covering table prefix are both valid.
+            let covers_destination = route.is_none_or(|route| {
+                ipv4_prefix(&route.prefix).is_some_and(|(network, length)| {
+                    u32::from(destination) & netmask(length) == u32::from(network)
+                })
+            });
+            let selected = route.map(|route| FibSelection {
+                egress_port: route.egress_port.clone(),
+                gateway: route.gateway,
+            });
             let (status, reason) = match (observed, lookup) {
                 (None, _) => (NotComparable, "missing_probe_observation"),
                 (_, None) => (NotComparable, "missing_kernel_lookup"),
+                (_, Some(_)) if !covers_destination => (
+                    NotComparable,
+                    "kernel_lookup_prefix_does_not_cover_destination",
+                ),
                 (_, Some(_)) if expected == selected => (Match, "fib_selection_agrees"),
                 (_, Some(_)) => (Mismatch, "fib_selection_differs"),
             };
@@ -746,11 +794,65 @@ fn route_miss(evidence: &Evidence) -> Option<StructuralRouteMiss> {
     })
 }
 
+fn fib_path_reaches_miss(
+    topology: &Topology,
+    probe: &StackProbe,
+    fib: &[FibComparison],
+    miss: &StructuralRouteMiss,
+) -> bool {
+    // A return-leg miss also depends on the request reaching the responding host.
+    for (direction, from, to) in [
+        (FibDirection::Request, probe.source, probe.destination),
+        (FibDirection::Reply, probe.destination, probe.source),
+    ] {
+        let destination = topology.interface(to).ipv4;
+        let mut port = from;
+        let mut visited = BTreeSet::new();
+        while port != to {
+            let node = topology.ports[port].device;
+            let id = &topology.devices[node].id;
+            if direction == miss.direction && id == &miss.node_id {
+                return true;
+            }
+            if !visited.insert(node) {
+                return false;
+            }
+            let Some(hop) = fib
+                .iter()
+                .find(|row| {
+                    row.direction == direction
+                        && &row.node_id == id
+                        && row.status == ComparisonStatus::Match
+                })
+                .and_then(|row| row.observed.as_ref())
+            else {
+                return false;
+            };
+            let next_hop = hop.gateway.unwrap_or(destination);
+            let Some(&peer) = topology.addresses.get(&next_hop) else {
+                return false;
+            };
+            if topology.ports[peer]
+                .link
+                .is_none_or(|link| topology.ports[link.peer].id != hop.egress_port)
+            {
+                return false;
+            }
+            port = peer;
+        }
+        if direction == miss.direction {
+            break;
+        }
+    }
+    false
+}
+
 fn compare_echo(
     modeled: Outcome,
     cause: Option<&Evidence>,
     observed: Option<&ProbeObservation>,
-    source_node: &str,
+    topology: &Topology,
+    probe: &StackProbe,
     fib: &[FibComparison],
 ) -> Result<ReachabilityComparison, RealStackError> {
     use ComparisonStatus::{Match, Mismatch, NotComparable};
@@ -763,9 +865,10 @@ fn compare_echo(
     };
     let route_miss = cause.and_then(route_miss);
     let outcome = observed.map(|probe| probe.outcome);
+    let source_node = &topology.devices[topology.ports[probe.source].device].id;
     let source_lookup = fib
         .iter()
-        .find(|row| row.node_id == source_node && row.direction == FibDirection::Request);
+        .find(|row| &row.node_id == source_node && row.direction == FibDirection::Request);
     let source_route = source_lookup
         .filter(|row| row.status != NotComparable)
         .map(|row| row.observed.is_some());
@@ -813,14 +916,18 @@ fn compare_echo(
                         && row.expected.is_none()
                         && row.observed.is_none()
                 });
-                let local = miss.node_id == source_node && miss.direction == FibDirection::Request;
-                if corroborated
-                    && (outcome == EchoOutcome::Timeout && !local
-                        || outcome == EchoOutcome::NoRoute && local)
+                let local = &miss.node_id == source_node && miss.direction == FibDirection::Request;
+                if !corroborated {
+                    (NotComparable, "structural_route_miss_without_matching_fib")
+                } else if !fib_path_reaches_miss(topology, probe, fib, miss) {
+                    (
+                        NotComparable,
+                        "structural_route_miss_without_matching_upstream_fib",
+                    )
+                } else if outcome == EchoOutcome::Timeout && !local
+                    || outcome == EchoOutcome::NoRoute && local
                 {
                     (Match, "structural_route_miss_corroborated_by_fib")
-                } else if !corroborated {
-                    (NotComparable, "structural_route_miss_without_matching_fib")
                 } else {
                     (
                         NotComparable,
@@ -904,7 +1011,7 @@ pub fn compare_real_stack(
         let source_node = &plan.nodes()[source.node].id;
         let (modeled, cause) = model_echo(&report, &probe.id)?;
         let fib = compare_fib(&plan, &topology, probe, observed)?;
-        let reachability = compare_echo(modeled, cause, observed, source_node, &fib)?;
+        let reachability = compare_echo(modeled, cause, observed, &topology, probe, &fib)?;
         probes.push(StackProbeComparison {
             probe_id: probe.id.clone(),
             source_node: source_node.clone(),

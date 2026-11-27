@@ -47,6 +47,40 @@ fn external_capture() -> Value {
 const STATIC_LAB: &str = include_str!("../examples/stack-static-lab.json");
 
 #[test]
+fn external_route_checks_interface_indices_when_both_were_captured() {
+    use reliner::stack_compare::compare_external_frr_route;
+
+    let mut capture: Value =
+        serde_json::from_str(include_str!("../examples/frr-route-observation.json")).unwrap();
+    let run = |c: &Value| compare_external_frr_route(STATIC_LAB, &c.to_string()).unwrap();
+    assert_eq!(run(&capture).status, ComparisonStatus::Match);
+    capture["installed"]["rib"]["stdout"]["203.0.113.0/24"][0]["nexthops"][0]["interfaceIndex"] =
+        json!(7);
+    let result = run(&capture);
+    assert_eq!(result.installed.rib_status, ComparisonStatus::Mismatch);
+    assert_eq!(result.installed.kernel_status, ComparisonStatus::Match);
+    assert_eq!(result.status, ComparisonStatus::Mismatch);
+}
+
+#[test]
+fn interrupted_kernel_dump_cannot_confirm_withdrawal() {
+    use reliner::stack_compare::compare_external_frr_route;
+
+    let mut capture = external_capture();
+    capture["withdrawn"]["kernel"]["stderr"] = json!("");
+    assert_eq!(
+        compare_external_frr_route(STATIC_LAB, &capture.to_string())
+            .unwrap()
+            .status,
+        ComparisonStatus::Match
+    );
+    let warning = "Dump was interrupted and may be inconsistent.";
+    capture["withdrawn"]["kernel"]["stderr"] = json!(format!("{warning}\n"));
+    let err = compare_external_frr_route(STATIC_LAB, &capture.to_string()).unwrap_err();
+    assert!(err.to_string().contains(warning), "{err}");
+}
+
+#[test]
 fn external_route_types_only_the_selected_rib_prefix_in_each_phase() {
     use reliner::stack_compare::compare_external_frr_route;
 
@@ -468,6 +502,97 @@ fn structural_return_route_miss_requires_a_matching_observed_fib_miss() {
         result.probes[0].reachability.reason,
         "structural_route_miss_without_matching_fib"
     );
+}
+
+#[test]
+fn return_route_miss_requires_agreement_on_both_legs_up_to_the_miss() {
+    let mut doc = routed();
+    doc["devices"][2]["routes"] = json!([]);
+    doc["devices"][1]["ports"]
+        .as_array_mut()
+        .unwrap()
+        .push(json!({
+            "id":"r1-branch","name":"Branch","ipv4":"198.18.0.1","prefix_length":30,
+            "mac":"02:00:00:00:01:03"
+        }));
+    doc["devices"].as_array_mut().unwrap().push(json!({
+        "kind":"router","id":"r3","name":"R3","ports":[{
+            "id":"r3-branch","name":"Branch","ipv4":"198.18.0.2","prefix_length":30,
+            "mac":"02:00:00:00:03:01"
+        }],"routes":[]
+    }));
+    doc["links"].as_array_mut().unwrap().push(json!({
+        "id":"r1-r3","ports":["r1-branch","r3-branch"],"delay_ns":"100"
+    }));
+    let mut observed = observation(&doc);
+    for probe in &mut observed.probes {
+        no_reply(probe, EchoOutcome::Timeout);
+        probe.kernel_lookups[5].selected = None; // R2 reply is the modeled miss.
+        probe.kernel_lookups.push(lookup(
+            "r3",
+            "request",
+            "203.0.113.20",
+            "r3-branch",
+            Some("198.18.0.1"),
+        ));
+    }
+    let result = compare(&doc, &observed);
+    assert!(
+        result.probes[0]
+            .fib
+            .iter()
+            .any(|row| row.node_id == "r3" && row.status == ComparisonStatus::Mismatch)
+    );
+    assert_eq!(
+        result.probes[0].reachability.status,
+        ComparisonStatus::Match
+    );
+
+    observed.probes[0].kernel_lookups[1] = lookup(
+        "r1",
+        "request",
+        "203.0.113.20",
+        "r1-branch",
+        Some("198.18.0.2"),
+    );
+    observed.probes[1].kernel_lookups.remove(3); // Sending host on the return leg.
+    for probe in compare(&doc, &observed).probes {
+        assert_eq!(probe.reachability.status, ComparisonStatus::NotComparable);
+        assert_eq!(
+            probe.reachability.reason,
+            "structural_route_miss_without_matching_upstream_fib"
+        );
+    }
+}
+
+#[test]
+fn selected_kernel_prefix_must_cover_the_query_address() {
+    let doc = routed();
+    let mut observed = observation(&doc);
+    for (prefix, expected) in [
+        ("0.0.0.0/0", ComparisonStatus::Match),
+        ("203.0.113.0/24", ComparisonStatus::Match),
+        ("203.0.113.20/32", ComparisonStatus::Match),
+        ("203.0.113.21/32", ComparisonStatus::NotComparable),
+        ("203.0.114.0/24", ComparisonStatus::NotComparable),
+    ] {
+        observed.probes[0].kernel_lookups[1]
+            .selected
+            .as_mut()
+            .unwrap()
+            .prefix = prefix.into();
+        let result = compare(&doc, &observed);
+        let row = result.probes[0]
+            .fib
+            .iter()
+            .find(|r| r.node_id == "r1" && r.direction == FibDirection::Request)
+            .unwrap();
+        assert_eq!(row.status, expected, "{prefix}");
+        assert_eq!(
+            result.probes[0].reachability.status,
+            ComparisonStatus::Match
+        );
+    }
 }
 
 #[test]

@@ -374,6 +374,7 @@ pub enum ErrorCode {
     UnsavedDocument,
     InvalidDocument,
     PathInUse,
+    SaveConflict,
     QueueFull,
     InputBudget,
     UnknownRun,
@@ -470,6 +471,7 @@ impl From<WorkspaceError> for BridgeError {
             ),
             WorkspaceError::InvalidDocument(_) => (ErrorCode::InvalidDocument, json!({})),
             WorkspaceError::PathInUse(path) => (ErrorCode::PathInUse, json!({"path": path})),
+            WorkspaceError::SaveConflict(path) => (ErrorCode::SaveConflict, json!({"path": path})),
             WorkspaceError::QueueFull => (ErrorCode::QueueFull, json!({})),
             WorkspaceError::InputBudget => (ErrorCode::InputBudget, json!({})),
             WorkspaceError::UnknownRun(id) => {

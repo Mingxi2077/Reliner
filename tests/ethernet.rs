@@ -26,7 +26,7 @@ fn native_vlan_frames_cross_a_trunk_without_a_tag() {
     let mut document = native_vlan_lab();
     let connected = report(&document);
     assert_eq!(connected["probes"][0]["outcome"]["status"], "reachable");
-    assert_eq!(connected["model_version"], 12);
+    assert_eq!(connected["model_version"], 14);
 
     document["devices"][2]["ports"][0]["mode"]
         .as_object_mut()

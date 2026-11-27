@@ -86,7 +86,7 @@ fn assert_rejected(value: Value, field: &str) {
 fn imported_facts_and_shared_coverage_round_trip_without_optional_trace() {
     let value = imported();
     assert_eq!(value["report"]["report_version"], 8);
-    assert_eq!(value["report"]["model_version"], 11);
+    assert_eq!(value["report"]["model_version"], 14);
     assert_eq!(
         value["report"]["probes"][0]["outcome"]["status"],
         "undetermined"
@@ -132,7 +132,7 @@ fn missing_and_empty_sources_need_no_fabricated_component_table() {
             doc.as_object_mut().unwrap().remove("import_source");
         }
         let original = envelope(&run_lab(&doc.to_string()).unwrap());
-        assert_eq!(original["report"]["model_version"], 11);
+        assert_eq!(original["report"]["model_version"], 14);
         assert_round_trip(original.clone());
         for coverage in [Value::Null, json!({"global_gaps": [], "components": []})] {
             let mut value = original.clone();

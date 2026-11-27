@@ -275,7 +275,7 @@ fn protected_reports_keep_the_initial_roles_even_without_link_events() {
     doc["scenario"]["link_actions"] = json!([]);
     let protected = report(&doc);
     assert_eq!(protected["report_version"], 3);
-    assert_eq!(protected["model_version"], 3);
+    assert_eq!(protected["model_version"], 14);
     assert_eq!(protected["link_events"], json!([]));
     assert_eq!(
         protected["settings"]["protected_links"],
@@ -287,6 +287,6 @@ fn protected_reports_keep_the_initial_roles_even_without_link_events() {
     doc["links"].as_array_mut().unwrap().remove(2);
     let original_format = report(&doc);
     assert_eq!(original_format["report_version"], 2);
-    assert_eq!(original_format["model_version"], 2);
+    assert_eq!(original_format["model_version"], 14);
     assert!(original_format["settings"].get("protected_links").is_none());
 }

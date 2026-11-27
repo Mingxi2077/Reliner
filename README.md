@@ -6,7 +6,7 @@ Reliner 是面向网络学习者和从业者的轻量拓扑实验与排障工具
 
 ## 运行第一个实验
 
-当前交付 Windows x64 命令行后端，桌面图形界面待接入。在 GitHub Releases 下载 0.4.0 的 Windows ZIP，解压后在该目录运行：
+当前交付 Windows x64 命令行后端，桌面图形界面待接入。解压 Windows 后端 ZIP 后，在该目录运行：
 
 ```powershell
 .\reliner.exe run .\examples\vlan-lab.json
@@ -201,7 +201,7 @@ cargo run --locked -- run examples/mtu-lab.json --json
 
 **Windows 本机已测 48 和 64 份文档。** 64 份文档的 8 秒短测中，纯编辑的后端切换 P99 约 0.002 ms、配置编辑 P99 小于 0.17 ms，进程峰值工作集 16.86 MiB。加入编译、运行和暂停后，峰值工作集 31.75 MiB。两档拓扑构成、调度限制及测量范围见[后端实测](docs/backend-technology-stack.md#windows-本机实测)。桌面画布渲染和低配机器留待验证。
 
-固定七发的组合园区在 CLI 和 Workspace 默认额度下实测跑完 366 台设备。368 台首次 STP 收敛前触及单事件上限；520 台只把单事件额度设为 12160，七发即可全部结案。[动态路由与默认停点复测](docs/backend-technology-stack.md#动态路由与默认停点复测)
+0.4.1 的固定七发组合园区在 CLI 和 Workspace 默认额度下实测跑完 434 台设备。同一拓扑增至 436 台时，首次 STP 收敛触及单事件额度。520 台只把单事件额度从 8192 调到 9823，七发均可结案。规模边界取决于拓扑结构和探测负载。[修复与复测记录](docs/backend-technology-stack.md#041-修复与复测)
 
 152 台、874 发的高密度场景在 Workspace 默认额度下可全部结案。520 台、3082 发只提高单事件额度时结案 1059 发后触及必要证据上限；再给出 7736 项证据额度，累计工作量沿用默认值即可全部结案。[高密度停点与相邻额度验证](docs/backend-technology-stack.md#逐包诊断与必要证据边界)
 
@@ -209,7 +209,7 @@ cargo run --locked -- run examples/mtu-lab.json --json
 
 ## 后端交付与报告回查
 
-Windows x64 的 0.4.0 包在 `dist/reliner-backend-0.4.0-x86_64-pc-windows-msvc.zip`，随包有可直接运行的 ACL 和 LLDP 样例。使用 `reliner run examples/acl-lab.json` 定位拦截回包的规则，使用 `reliner lldp check examples/lldp-peer.pcap examples/lldp-expected.json` 核对实际通告的对端。后者也可经 JSONL 命令 `lldp.check` 传入 `path` 和 `expectation`。 [新功能和示例](docs/backend-release.md#040-新增排障入口)
+本地构建的 Windows x64 修正版为 `dist/reliner-backend-0.4.1-x86_64-pc-windows-msvc.zip`，已发布的版本可在 GitHub Releases 获取。随包的 ACL 示例可用 `reliner run examples/acl-lab.json` 定位拦截回包的规则；LLDP 示例可用 `reliner lldp check examples/lldp-peer.pcap examples/lldp-expected.json` 核对实际通告的对端。后者也可经 JSONL 命令 `lldp.check` 传入 `path` 和 `expectation`。[使用说明](docs/backend-release.md)
 
 ```powershell
 .\target\release\reliner.exe validate .\examples\campus-lab.json --json
